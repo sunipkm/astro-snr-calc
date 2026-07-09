@@ -125,7 +125,7 @@ You can also use the package directly from Python.
 ```python
 import astropy.units as u
 
-from snr_calc import (
+from astro_snr_calc import (
     ExposureGrid,
     PhotometricBand,
     SNRResult,
@@ -225,5 +225,5 @@ The plot includes logarithmic SNR coloring, contour overlays, and a hatched satu
 To run the CLI from the source tree without installing the package:
 
 ```bash
-PYTHONPATH=src python -m snr_calc.cli --help
+PYTHONPATH=src python -m astro_snr_calc.cli --help
 ```

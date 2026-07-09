@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "astro-snr-calc"
-version = "0.0.1"
+dynamic = ["version"]
 description = "SNR modelling library and CLI for astronomical imagers"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
-SNRCalc = "snr_calc.cli:main"
+SNRCalc = "astro_snr_calc.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

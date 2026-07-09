@@ -10,7 +10,7 @@ drive the PSF computation via the ZOS-API.
 import sys
 import logging
 
-from snr_calc.snr_calculator import (
+from astro_snr_calc.snr_calculator import (
     ExposureGrid, PhotometricBand,
     SNRResult, Sensor,
     SkyBrightness, Telescope,
@@ -119,7 +119,7 @@ def main():
         )
         models = [("Analytic (on-axis)", model)]
     elif sys.platform == "win32" and zemax_file is not None:
-        from snr_calc.zemax_iface import ZemaxConfig
+        from astro_snr_calc.zemax_iface import ZemaxConfig
         config = ZemaxConfig(
             zemax_file=zemax_file,
             pupil_sampling=args.pupil_sampling,

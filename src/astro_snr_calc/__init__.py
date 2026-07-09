@@ -1,4 +1,4 @@
-"""snr_calc - SNR modelling library for astronomical imagers."""
+"""astro_snr_calc - SNR modelling library for astronomical imagers."""
 
 from .snr_calculator import (
     DetectorPSF,
