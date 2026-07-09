@@ -177,10 +177,35 @@ Top-level exports include:
 
 Zemax integration is only available on Windows. The module raises an import error on other platforms.
 
+This package uses the Zemax OpticStudio ZOS-API through `pythonnet`. In practice, that means the Python code connects to a local OpticStudio installation, loads the ZOS-API .NET assemblies, and drives OpticStudio programmatically instead of relying on a hand-entered first-order telescope model.
+
+When a `.zmx` file is supplied, the ZOS-API path does the following:
+
+- locates the local OpticStudio installation from the Windows registry,
+- loads the ZOS-API helper and core .NET assemblies,
+- opens the Zemax design file in OpticStudio,
+- extracts first-order optical properties such as entrance pupil diameter, effective focal length, and working f-number,
+- enumerates the defined field points in the prescription,
+- runs either FFT PSF or Huygens PSF analysis for one or more selected fields,
+- converts the returned PSF grid into detector-pixel flux fractions,
+- builds the same SNR model used by analytic mode, but with a PSF derived from the optical design.
+
+The practical effect is that SNR estimates can reflect field-dependent image quality from the Zemax design rather than assuming an ideal on-axis Airy pattern.
+
 When using a `.zmx` file, the CLI can request FFT or Huygens PSF calculations through OpticStudio. The Windows-only CLI also supports:
 
 - `--huygens`: use Huygens PSF analysis instead of FFT.
 - `--as-extension`: connect to a running interactive OpticStudio session.
+
+Use FFT PSF when you want faster iteration and Huygens PSF when you need a more general, higher-fidelity diffraction calculation. Huygens is slower and can become expensive at high sampling settings.
+
+Windows requirements for the Zemax path:
+
+- OpticStudio installed locally.
+- A license valid for ZOS-API use.
+- `pythonnet`, which is installed automatically from the package metadata on Windows.
+
+The package does not bundle Zemax itself or the ZOS-API assemblies. Those come from the local OpticStudio installation.
 
 If Zemax is not available, use analytic mode with a telescope TOML file.
 
