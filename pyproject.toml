@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astro-snr-calc"
+version = "0.0.1"
+description = "SNR modelling library and CLI for astronomical imagers"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Sunip K. Mukherjee", email = "sunipkmukherjee@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = [
+    "astropy",
+    "matplotlib",
+    "numpy",
+    "scipy",
+    "serde-dataclass",
+    "dacite",
+    "tomlkit",
+]
+
+[project.scripts]
+SNRCalc = "snr_calc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
