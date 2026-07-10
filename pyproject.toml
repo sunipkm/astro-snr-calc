@@ -14,15 +14,18 @@ dependencies = [
     "astropy",
     "matplotlib",
     "numpy",
+    "scipy",
     "pythonnet; sys_platform == 'win32'",
     "scipy",
     "serde-dataclass",
     "dacite",
     "tomlkit",
+    "xarray",
 ]
 
 [project.scripts]
 SNRCalc = "astro_snr_calc.snr_cli:main"
+FieldScan = "astro_snr_calc.field_scan_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

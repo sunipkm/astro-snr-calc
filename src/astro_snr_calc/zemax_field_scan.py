@@ -45,13 +45,20 @@ Usage (with snr_calc.zemax_iface):
 """
 from __future__ import annotations
 
+import sys
+if sys.platform != "win32":
+    raise RuntimeError("Zemax field scan only works on Windows with the ZOS-API")
+
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import astropy.units as u
 import numpy as np
 from tqdm import tqdm
+from xarray import DataArray
+
+from .zemax_iface import ZOSConnection
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +112,155 @@ class FieldScanConfig:
             return np.sort([q.to(unit).value for q in self.y_points])
         lo, hi = (q.to(unit).value for q in self.y_range)
         return np.linspace(lo, hi, self.n_y)
+    
+    def scan_image_plane(self, zos: ZOSConnection) -> SpotScanResult:
+        """Trace ray bundles over the field grid and reduce to spot maps."""
+        ZOSAPI = zos.ZOSAPI
+        sd = zos.system.SystemData
+
+        # -- wavelengths -------------------------------------------------------
+        added_waves: list[int] = []
+        if self.wavelengths is None:
+            n_wave_def = sd.Wavelengths.NumberOfWavelengths
+            wave_indices = list(range(1, n_wave_def + 1))
+            wavelengths_um = [float(sd.Wavelengths.GetWavelength(w).Wavelength)
+                            for w in wave_indices]
+        else:
+            wave_indices, wavelengths_um, added_waves = _resolve_wavelengths(
+                zos, self.wavelengths
+            )
+
+        # -- geometry ----------------------------------------------------------
+        if self.normalization is not None:
+            set_field_normalization(zos, self.normalization)
+        field_unit, unit_name = _field_unit(zos)
+        x_ax = self.x_axis(field_unit)
+        y_ax = self.y_axis(field_unit)
+        to_norm = _field_normalizer(zos, x_ax, y_ax)
+        px, py = hexapolar_pupil(self.pupil_rings)
+        rays_per_point = px.size
+
+        lens_to_um = 1000.0  # lens units are mm for these systems
+        image_surf = zos.system.LDE.NumberOfSurfaces - 1
+        opd_none = getattr(ZOSAPI.Tools.RayTrace.OPDMode, "None")
+
+        n_points = x_ax.size * y_ax.size * len(wave_indices)
+        n_rays = n_points * rays_per_point
+        logger.info(
+            "scan: %d x %d field grid, %d wavelength(s), %d rays/point "
+            "-> %d rays total",
+            x_ax.size, y_ax.size, len(wave_indices), rays_per_point, n_rays,
+        )
+
+        # ray bookkeeping: rays are read back in the order they were added
+        jobs = [(iw, iy, ix)
+                for iw in range(len(wave_indices))
+                for iy in range(y_ax.size)
+                for ix in range(x_ax.size)]
+
+        sum_x = np.zeros((len(wave_indices), y_ax.size, x_ax.size))
+        sum_y = np.zeros_like(sum_x)
+        sum_r2 = np.zeros_like(sum_x)
+        n_valid = np.zeros_like(sum_x, dtype=int)
+        xy_store: list[list[tuple[int, float, float]]] = \
+            [[] for _ in range(y_ax.size * x_ax.size)]
+
+        # -- chunked batch trace -------------------------------------------------
+        chunk_pts = max(1, self.batch_chunk // rays_per_point)
+        pbar = tqdm(total=n_rays, unit="rays", unit_scale=True, desc="Raycasting", dynamic_ncols=True)
+        try:
+            for start in range(0, len(jobs), chunk_pts):
+                chunk = jobs[start:start + chunk_pts]
+                tool = zos.system.Tools.OpenBatchRayTrace()
+                try:
+                    norm_unpol = tool.CreateNormUnpol(
+                        len(chunk) * rays_per_point,
+                        ZOSAPI.Tools.RayTrace.RaysType.Real, image_surf,
+                    )
+                    for iw, iy, ix in chunk:
+                        hx, hy = to_norm(x_ax[ix], y_ax[iy])
+                        for k in range(rays_per_point):
+                            norm_unpol.AddRay(wave_indices[iw], hx, hy,
+                                            float(px[k]), float(py[k]), opd_none)
+                    logger.debug("scan: tracing rays %d..%d of %d ...",
+                                start * rays_per_point,
+                                (start + len(chunk)) * rays_per_point, n_rays)
+                    pbar.update(len(chunk) * rays_per_point)
+                    tool.RunAndWaitForCompletion()
+                    norm_unpol.StartReadingResults()
+
+                    reader, first = _make_ray_reader(norm_unpol)
+                    res, fresh = first, False
+                    for j, (iw, iy, ix) in enumerate(chunk):
+                        for _ in range(rays_per_point):
+                            if fresh:
+                                raw = reader()
+                                res = (bool(raw[0]), int(raw[1]), int(raw[2]),
+                                    int(raw[3]), float(raw[4]), float(raw[5]))
+                            fresh = True
+                            ok, _, err, vig, xr, yr = res
+                            if not ok:
+                                raise RuntimeError(
+                                    "Batch ray trace returned fewer results than "
+                                    "rays added."
+                                )
+                            if err == 0 and vig == 0:
+                                x_um, y_um = xr * lens_to_um, yr * lens_to_um
+                                sum_x[iw, iy, ix] += x_um
+                                sum_y[iw, iy, ix] += y_um
+                                n_valid[iw, iy, ix] += 1
+                                xy_store[iy * x_ax.size + ix].append(
+                                    (iw, x_um, y_um))
+                finally:
+                    tool.Close()
+
+        finally:
+            pbar.close()
+            # restore the prescription: remove wavelengths this scan added
+            for idx in sorted(added_waves, reverse=True):
+                zos.system.SystemData.Wavelengths.RemoveWavelength(idx)
+                logger.info("wavelengths: removed temporary table "
+                            "entry %d", idx)
+
+        # -- reduce: per-wavelength centroid + RMS ---------------------------------
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cx = np.where(n_valid > 0, sum_x / n_valid, np.nan)
+            cy = np.where(n_valid > 0, sum_y / n_valid, np.nan)
+        rms = np.full_like(cx, np.nan)
+        rms_poly = np.full((y_ax.size, x_ax.size), np.nan)
+        for iy in range(y_ax.size):
+            for ix in range(x_ax.size):
+                pts = xy_store[iy * x_ax.size + ix]
+                if not pts:
+                    continue
+                arr = np.asarray(pts)                      # (n, 3): iw, x, y
+                for iw in range(len(wave_indices)):
+                    sel = arr[arr[:, 0] == iw]
+                    if sel.size:
+                        dx = sel[:, 1] - cx[iw, iy, ix]
+                        dy = sel[:, 2] - cy[iw, iy, ix]
+                        rms[iw, iy, ix] = np.sqrt(np.mean(dx ** 2 + dy ** 2))
+                # polychromatic: pool all rays around a common centroid
+                dx = arr[:, 1] - arr[:, 1].mean()
+                dy = arr[:, 2] - arr[:, 2].mean()
+                rms_poly[iy, ix] = np.sqrt(np.mean(dx ** 2 + dy ** 2))
+
+        n_dead = int(np.sum(n_valid.sum(axis=0) == 0))
+        if n_dead:
+            logger.warning("scan: %d grid point(s) had no valid rays "
+                        "(vignetting or trace errors) -> NaN", n_dead)
+
+        return SpotScanResult(
+            x_field=x_ax, y_field=y_ax,
+            field_unit=field_unit, unit_name=unit_name,
+            wave_indices=wave_indices, wavelengths_um=wavelengths_um,
+            centroid_x_um=cx, centroid_y_um=cy,
+            rms_um=rms, rms_poly_um=rms_poly, n_valid=n_valid,
+            rays=(_rays_ndarray(xy_store, x_ax, y_ax)
+                if self.keep_rays else None),
+        )
+
+
 
 
 def hexapolar_pupil(n_rings: int) -> tuple[np.ndarray, np.ndarray]:
@@ -152,12 +308,127 @@ class SpotScanResult:
 
     RAY_COLUMNS = ("wave_pos", "field_x", "field_y", "x_um", "y_um")
 
+    # ======================================================================
+    # The scan
+    # ======================================================================
+    @staticmethod
+    def concat_scans(results: Sequence[SpotScanResult]) -> SpotScanResult:
+        """Combine multiple SpotScanResults into one.
+
+        Two merge modes, chosen automatically:
+        * FIELD merge — identical wavelengths and one identical field axis:
+            results are concatenated along the other (slit) axis and sorted.
+            Use case: densifying slit regions with separate scans (e.g. after
+            an undersampling warning) without redoing the whole slit.
+        * WAVELENGTH merge — identical field grids: results are stacked
+            along the wavelength axis.  Use case: scanning lines in batches.
+
+        Per-ray data merges too: rays carry absolute field coordinates, so
+        no re-indexing of positions is needed (wavelength merge offsets the
+        wave_pos column).  Duplicate field samples / repeated grids raise.
+        """
+        if len(results) < 2:
+            return results[0]
+        r0 = results[0]
+        if any(r.unit_name != r0.unit_name for r in results):
+            raise ValueError("cannot merge scans with different field units")
+        same_lam = all(np.array_equal(r.wavelengths_um, r0.wavelengths_um)
+                    for r in results)
+        same_x = all(np.array_equal(r.x_field, r0.x_field) for r in results)
+        same_y = all(np.array_equal(r.y_field, r0.y_field) for r in results)
+
+        def cat_rays(offsets=None):
+            parts = []
+            for i, r in enumerate(results):
+                if r.rays is None:
+                    return None
+                rr = r.rays
+                if offsets is not None and offsets[i]:
+                    rr = rr.copy()
+                    rr[:, 0] += offsets[i]
+                parts.append(rr)
+            return np.concatenate(parts)
+
+        if same_lam and (same_x or same_y):
+            # ---- field merge along the non-identical axis ----
+            axis = "y" if same_x else "x"
+            coords = np.concatenate([getattr(r, f"{axis}_field")
+                                    for r in results])
+            if np.unique(coords).size != coords.size:
+                raise ValueError(f"duplicate {axis} field samples across "
+                                f"scans; cannot merge")
+            order = np.argsort(coords)
+            np_axis = 1 if axis == "y" else 2
+            def cat(name):
+                a = np.concatenate([getattr(r, name) for r in results],
+                                axis=np_axis)
+                return np.take(a, order, axis=np_axis)
+            rms_poly = np.take(
+                np.concatenate([r.rms_poly_um for r in results],
+                            axis=np_axis - 1),
+                order, axis=np_axis - 1)
+            kw = dict(x_field=r0.x_field, y_field=coords[order]) \
+                if axis == "y" else \
+                dict(x_field=coords[order], y_field=r0.y_field)
+            return SpotScanResult(
+                field_unit=r0.field_unit, unit_name=r0.unit_name,
+                wave_indices=r0.wave_indices,
+                wavelengths_um=r0.wavelengths_um,
+                centroid_x_um=cat("centroid_x_um"),
+                centroid_y_um=cat("centroid_y_um"),
+                rms_um=cat("rms_um"), rms_poly_um=rms_poly,
+                n_valid=cat("n_valid"), rays=cat_rays(), **kw)
+
+        if same_x and same_y:
+            # ---- wavelength merge on the identical grid ----
+            lams, seen = [], set()
+            for r in results:
+                for lam in r.wavelengths_um:
+                    if lam in seen:
+                        raise ValueError(f"wavelength {lam} um appears in "
+                                        f"multiple scans")
+                    seen.add(lam)
+                    lams.append(lam)
+            offsets = np.cumsum([0] + [len(r.wavelengths_um)
+                                    for r in results[:-1]])
+            def cat0(name):
+                return np.concatenate([getattr(r, name) for r in results],
+                                    axis=0)
+            # polychromatic RMS is NOT reconstructible from per-wave stats;
+            # conservatively recompute from rays if available, else NaN
+            rays = cat_rays(offsets)
+            rms_poly = np.full_like(r0.rms_poly_um, np.nan)
+            if rays is not None:
+                for iy, yv in enumerate(r0.y_field):
+                    for ix, xv in enumerate(r0.x_field):
+                        sel = (np.isclose(rays[:, 1], xv)
+                            & np.isclose(rays[:, 2], yv))
+                        if sel.any():
+                            xy = rays[sel][:, 3:5]
+                            rms_poly[iy, ix] = np.sqrt(
+                                np.mean(np.sum((xy - xy.mean(0)) ** 2, 1)))
+            return SpotScanResult(
+                x_field=r0.x_field, y_field=r0.y_field,
+                field_unit=r0.field_unit, unit_name=r0.unit_name,
+                wave_indices=[w for r in results for w in r.wave_indices],
+                wavelengths_um=lams,
+                centroid_x_um=cat0("centroid_x_um"),
+                centroid_y_um=cat0("centroid_y_um"),
+                rms_um=cat0("rms_um"), rms_poly_um=rms_poly,
+                n_valid=cat0("n_valid"), rays=rays)
+
+        raise ValueError(
+            "scans are not mergeable: need identical wavelengths plus one "
+            "shared field axis (field merge), or identical field grids "
+            "(wavelength merge)")
+
+
     # ---- composition ----------------------------------------------------
     def __add__(self, other):
         """`a + b` concatenates scans in memory (see concat_scans)."""
         if not isinstance(other, SpotScanResult):
             return NotImplemented
-        return concat_scans([self, other])
+        return self.concat_scans([self, other])
 
     def __radd__(self, other):
         """Supports sum(results): 0 + result -> result."""
@@ -204,32 +475,205 @@ class SpotScanResult:
                 rays=z["rays"] if "rays" in z.files else None,
             )
 
-    def to_image(self, pixel_pitch: u.Quantity,
-                 detector_mm: Optional[tuple[float, float]] = None,
-                 method: str = "auto",
-                 detector_center_mm: tuple[float, float] = (0.0, 0.0),
-                 oversample: int = 4):
-        """Render the spectral lines onto a pixel grid -> xarray.DataArray.
+    def to_image(
+            self, pixel_pitch: u.Quantity,
+            detector_mm: Optional[tuple[float, float]] = None,
+            method: str = "auto",
+            detector_center_mm: tuple[float, float] = (0.0, 0.0),
+            oversample: int = 4
+        ) -> "DataArray":
+        """Compute the detector image (no plotting).
 
-        Pure computation, no plotting: dims ("y", "x") with pixel-center
-        coordinates in mm, values = flux per pixel as a fraction of each
-        (unit-flux) line.  Metadata in .attrs: pixel_pitch_um, method,
-        wavelengths_nm, and per-line center positions (line_x_mm,
-        line_y_mm) for annotation.  Pass the result to
-        `plot_detector_image`, or use xarray directly (da.plot(),
-        da.sel(...), da.to_netcdf(...)).
+        Coordinate convention: all positions are in the Zemax image surface's
+        LOCAL frame, origin at the surface vertex (the batch-ray X/Y, i.e.
+        the Footprint Diagram convention — not the chief-ray-relative Spot
+        Diagram convention).  `detector_mm` places the pixel grid centered on
+        `detector_center_mm` (default: the vertex); use the offset when the
+        physical detector is mounted off the image-surface vertex.
 
-        See `_render_image` for the method semantics ("rays" true spot
-        shapes / "gaussian" approximation / "auto").
+        Returns (image, x_centers_mm, y_centers_mm, attrs); image is
+        (n_pix_y, n_pix_x), row 0 at min y.
+
+        method:
+        "rays"     true spot shapes: traced ray landing coordinates are
+                    deposited onto the pixels; between scanned slit samples
+                    the two neighboring ray clouds are re-centered onto the
+                    interpolated centroid and cross-faded, preserving coma
+                    tails, astigmatic elongation, and other real structure.
+                    Requires a scan with keep_rays=True.
+        "gaussian" analytic approximation: sigma = RMS/sqrt(2), integrated
+                    over pixel boundaries (per-axis erf).
+        "auto"     "rays" when ray data is present, else "gaussian".
+
+        oversample (rays method only): rays are deposited on a grid
+        `oversample` times finer, then block-summed to the native pitch.
+        This integrates flux over the pixel AREA and removes pixel-phase
+        aliasing when the line width is below the pixel pitch (banding along
+        a sharp line).  Flux is exactly conserved.  1 disables.
         """
-        import xarray as xr
+        if method == "auto":
+            method = "rays" if self.rays is not None else "gaussian"
+        if method == "rays" and self.rays is None:
+            raise ValueError("method='rays' needs a scan with keep_rays=True")
+        if method not in ("rays", "gaussian"):
+            raise ValueError(f"unknown method {method!r}")
 
-        image, x_c, y_c, attrs = _render_image(self, pixel_pitch,
-                                               detector_mm, method,
-                                               detector_center_mm,
-                                               oversample)
-        return xr.DataArray(image, dims=("y", "x"),
-                            coords={"x": x_c, "y": y_c},
+        pitch_mm = pixel_pitch.to(u.um).value / 1000.0
+        n_lines = len(self.wavelengths_um)
+        n_x = self.x_field.size
+
+        # per-line data: one sub-curve per column ACROSS the slit (the slit
+        # runs along the larger scan axis).  A 2-D scan — e.g. several field
+        # columns sampling a finite slit WIDTH — is rendered as parallel
+        # sub-curves sharing the line's unit flux, not as one raveled
+        # zigzag path.
+        n_y = self.y_field.size
+        slit_along_y = n_y >= n_x
+        n_cols = n_x if slit_along_y else n_y
+        if n_cols > 1:
+            logger.info("render: %d columns across the slit per line",
+                        n_cols)
+        lines = []
+        for k in range(n_lines):
+            CX = self.centroid_x_um[k] / 1000.0        # (n_y, n_x) [mm]
+            CY = self.centroid_y_um[k] / 1000.0
+            W = self.rms_um[k] / 1000.0
+            curves = []
+            for c in range(n_cols):
+                if slit_along_y:
+                    cx, cy, w = CX[:, c], CY[:, c], W[:, c]
+                    flats = np.arange(n_y) * n_x + c
+                else:
+                    cx, cy, w = CX[c, :], CY[c, :], W[c, :]
+                    flats = c * n_x + np.arange(n_x)
+                good = np.isfinite(cx) & np.isfinite(cy) & np.isfinite(w)
+                if not good.any():
+                    continue
+                cx, cy, w = cx[good], cy[good], w[good]
+                clouds = None
+                if method == "rays":
+                    clouds = []
+                    for flat in flats[good]:
+                        iy, ix = divmod(int(flat), n_x)
+                        r = self.rays_at(k, iy, ix) / 1000.0      # mm
+                        clouds.append(r - [cx[len(clouds)],
+                                        cy[len(clouds)]])     # centered
+                curves.append((cx, cy, w, clouds))
+            lines.append(curves if curves else None)
+
+        # pixel-grid extent
+        if detector_mm is not None:
+            dw, dh = detector_mm
+            cx0, cy0 = detector_center_mm
+            x_min, x_max = cx0 - dw / 2, cx0 + dw / 2
+            y_min, y_max = cy0 - dh / 2, cy0 + dh / 2
+        else:
+            curves_all = [C for L in lines if L is not None for C in L]
+            allx = np.concatenate([C[0] for C in curves_all])
+            ally = np.concatenate([C[1] for C in curves_all])
+            if method == "rays":
+                dev = max(float(np.abs(cl).max()) for C in curves_all
+                        for cl in C[3])
+            else:
+                dev = 5.0 * max(float(C[2].max()) for C in curves_all)
+            m = dev + 2.0 * pitch_mm
+            x_min, x_max = allx.min() - m, allx.max() + m
+            y_min, y_max = ally.min() - m, ally.max() + m
+        n_px = int(np.ceil((x_max - x_min) / pitch_mm))
+        n_py = int(np.ceil((y_max - y_min) / pitch_mm))
+        x_edges = x_min + np.arange(n_px + 1) * pitch_mm
+        y_edges = y_min + np.arange(n_py + 1) * pitch_mm
+        ov = max(1, int(oversample)) if method == "rays" else 1
+        pitch_f = pitch_mm / ov               # deposition grid (rays)
+        n_pxf, n_pyf = n_px * ov, n_py * ov
+        image = np.zeros((n_pyf, n_pxf))
+        logger.info("render: %d x %d pixels at %g um pitch, method=%s, "
+                    "oversample=%d", n_px, n_py,
+                    pixel_pitch.to(u.um).value, method, ov)
+
+        for k, L in enumerate(lines):
+            if L is None:
+                continue
+            # diagnostics on the central column only (columns are near-copies)
+            mid = L[len(L) // 2]
+            if method == "rays" and mid[0].size > 1:
+                _warn_undersampled_shape(self, k, mid[0], mid[1], mid[2])
+            # each sub-curve carries an equal share of the line's unit flux
+            for cx, cy, w, clouds in L:
+                # fine samples along the line (arc length, ~pitch/2 steps)
+                if cx.size > 1:
+                    ds = np.hypot(np.diff(cx), np.diff(cy))
+                    t = np.concatenate(([0.0], np.cumsum(ds)))
+                    n_fine = max(cx.size,
+                                int(np.ceil(t[-1] / (pitch_f / 2.0))) + 1)
+                    tf = np.linspace(0.0, t[-1], n_fine)
+                    cxf = np.interp(tf, t, cx)
+                    cyf = np.interp(tf, t, cy)
+                    wf = np.interp(tf, t, w)
+                    seg = np.clip(np.searchsorted(t, tf, side="right") - 1,
+                                0, cx.size - 2)
+                    frac = np.where(np.diff(t)[seg] > 0,
+                                    (tf - t[seg]) / np.diff(t)[seg], 0.0)
+                else:
+                    cxf, cyf, wf = cx, cy, w
+                    seg = np.zeros(1, dtype=int)
+                    frac = np.zeros(1)
+                flux = 1.0 / (cxf.size * len(L))
+
+                if method == "gaussian":
+                    from scipy.special import erf
+
+                    for j in range(cxf.size):
+                        sigma = max(wf[j] / np.sqrt(2.0), 1e-9)
+                        half = 4.0 * sigma
+                        i0 = max(0, np.searchsorted(x_edges, cxf[j] - half) - 1)
+                        i1 = min(n_px, np.searchsorted(x_edges, cxf[j] + half) + 1)
+                        j0 = max(0, np.searchsorted(y_edges, cyf[j] - half) - 1)
+                        j1 = min(n_py, np.searchsorted(y_edges, cyf[j] + half) + 1)
+                        if i0 >= i1 or j0 >= j1:
+                            continue
+                        sq = sigma * np.sqrt(2.0)
+                        fx = 0.5 * np.diff(erf((x_edges[i0:i1 + 1] - cxf[j]) / sq))
+                        fy = 0.5 * np.diff(erf((y_edges[j0:j1 + 1] - cyf[j]) / sq))
+                        image[j0:j1, i0:i1] += flux * np.outer(fy, fx)
+                else:
+                    def deposit(pts_x, pts_y, weight):
+                        ip = np.floor((pts_x - x_min) / pitch_f).astype(int)
+                        jp = np.floor((pts_y - y_min) / pitch_f).astype(int)
+                        ok = (ip >= 0) & (ip < n_pxf) & (jp >= 0) & (jp < n_pyf)
+                        np.add.at(image, (jp[ok], ip[ok]), weight)
+
+                    for j in range(cxf.size):
+                        a, f = int(seg[j]), float(frac[j])
+                        for cloud, wgt in ((clouds[a], (1.0 - f)),
+                                        (clouds[min(a + 1, len(clouds) - 1)],
+                                            f)):
+                            if wgt <= 0.0 or cloud.shape[0] == 0:
+                                continue
+                            deposit(cloud[:, 0] + cxf[j], cloud[:, 1] + cyf[j],
+                                    flux * wgt / cloud.shape[0])
+
+
+        if ov > 1:
+            image = image.reshape(n_py, ov, n_px, ov).sum(axis=(1, 3))
+
+        x_centers = x_min + (np.arange(n_px) + 0.5) * pitch_mm
+        y_centers = y_min + (np.arange(n_py) + 0.5) * pitch_mm
+        attrs = {
+            "units": "fraction of line flux per pixel",
+            "pixel_pitch_um": float(pixel_pitch.to(u.um).value),
+            "method": method,
+            "wavelengths_nm": [lam * 1000.0 for lam in self.wavelengths_um],
+            "line_x_mm": [float(np.mean(np.concatenate([C[0] for C in L])))
+                        if L is not None else np.nan for L in lines],
+            "line_y_mm": [float(np.mean(np.concatenate([C[1] for C in L])))
+                        if L is not None else np.nan for L in lines],
+            "detector_center_mm": list(detector_center_mm),
+            "origin": "Zemax image-surface vertex (local frame)",
+        }
+        coords = {"x": x_centers, "y": y_centers}
+        coords.update(_image_secondary_coords(self, x_centers, y_centers, attrs))
+        return DataArray(image, dims=("y", "x"), coords=coords,
                             attrs=attrs, name="flux")
 
     def rays_at(self, wave_pos: int, iy: int, ix: int) -> np.ndarray:
@@ -437,121 +881,6 @@ def _make_ray_reader(norm_unpol):
         "pythonnet calling convention."
     )
 
-
-# ======================================================================
-# The scan
-# ======================================================================
-def concat_scans(results: list) -> SpotScanResult:
-    """Combine multiple SpotScanResults into one.
-
-    Two merge modes, chosen automatically:
-      * FIELD merge — identical wavelengths and one identical field axis:
-        results are concatenated along the other (slit) axis and sorted.
-        Use case: densifying slit regions with separate scans (e.g. after
-        an undersampling warning) without redoing the whole slit.
-      * WAVELENGTH merge — identical field grids: results are stacked
-        along the wavelength axis.  Use case: scanning lines in batches.
-
-    Per-ray data merges too: rays carry absolute field coordinates, so
-    no re-indexing of positions is needed (wavelength merge offsets the
-    wave_pos column).  Duplicate field samples / repeated grids raise.
-    """
-    if len(results) < 2:
-        return results[0]
-    r0 = results[0]
-    if any(r.unit_name != r0.unit_name for r in results):
-        raise ValueError("cannot merge scans with different field units")
-    same_lam = all(np.array_equal(r.wavelengths_um, r0.wavelengths_um)
-                   for r in results)
-    same_x = all(np.array_equal(r.x_field, r0.x_field) for r in results)
-    same_y = all(np.array_equal(r.y_field, r0.y_field) for r in results)
-
-    def cat_rays(offsets=None):
-        parts = []
-        for i, r in enumerate(results):
-            if r.rays is None:
-                return None
-            rr = r.rays
-            if offsets is not None and offsets[i]:
-                rr = rr.copy()
-                rr[:, 0] += offsets[i]
-            parts.append(rr)
-        return np.concatenate(parts)
-
-    if same_lam and (same_x or same_y):
-        # ---- field merge along the non-identical axis ----
-        axis = "y" if same_x else "x"
-        coords = np.concatenate([getattr(r, f"{axis}_field")
-                                 for r in results])
-        if np.unique(coords).size != coords.size:
-            raise ValueError(f"duplicate {axis} field samples across "
-                             f"scans; cannot merge")
-        order = np.argsort(coords)
-        np_axis = 1 if axis == "y" else 2
-        def cat(name):
-            a = np.concatenate([getattr(r, name) for r in results],
-                               axis=np_axis)
-            return np.take(a, order, axis=np_axis)
-        rms_poly = np.take(
-            np.concatenate([r.rms_poly_um for r in results],
-                           axis=np_axis - 1),
-            order, axis=np_axis - 1)
-        kw = dict(x_field=r0.x_field, y_field=coords[order]) \
-            if axis == "y" else \
-            dict(x_field=coords[order], y_field=r0.y_field)
-        return SpotScanResult(
-            field_unit=r0.field_unit, unit_name=r0.unit_name,
-            wave_indices=r0.wave_indices,
-            wavelengths_um=r0.wavelengths_um,
-            centroid_x_um=cat("centroid_x_um"),
-            centroid_y_um=cat("centroid_y_um"),
-            rms_um=cat("rms_um"), rms_poly_um=rms_poly,
-            n_valid=cat("n_valid"), rays=cat_rays(), **kw)
-
-    if same_x and same_y:
-        # ---- wavelength merge on the identical grid ----
-        lams, seen = [], set()
-        for r in results:
-            for lam in r.wavelengths_um:
-                if lam in seen:
-                    raise ValueError(f"wavelength {lam} um appears in "
-                                     f"multiple scans")
-                seen.add(lam)
-                lams.append(lam)
-        offsets = np.cumsum([0] + [len(r.wavelengths_um)
-                                   for r in results[:-1]])
-        def cat0(name):
-            return np.concatenate([getattr(r, name) for r in results],
-                                  axis=0)
-        # polychromatic RMS is NOT reconstructible from per-wave stats;
-        # conservatively recompute from rays if available, else NaN
-        rays = cat_rays(offsets)
-        rms_poly = np.full_like(r0.rms_poly_um, np.nan)
-        if rays is not None:
-            for iy, yv in enumerate(r0.y_field):
-                for ix, xv in enumerate(r0.x_field):
-                    sel = (np.isclose(rays[:, 1], xv)
-                           & np.isclose(rays[:, 2], yv))
-                    if sel.any():
-                        xy = rays[sel][:, 3:5]
-                        rms_poly[iy, ix] = np.sqrt(
-                            np.mean(np.sum((xy - xy.mean(0)) ** 2, 1)))
-        return SpotScanResult(
-            x_field=r0.x_field, y_field=r0.y_field,
-            field_unit=r0.field_unit, unit_name=r0.unit_name,
-            wave_indices=[w for r in results for w in r.wave_indices],
-            wavelengths_um=lams,
-            centroid_x_um=cat0("centroid_x_um"),
-            centroid_y_um=cat0("centroid_y_um"),
-            rms_um=cat0("rms_um"), rms_poly_um=rms_poly,
-            n_valid=cat0("n_valid"), rays=rays)
-
-    raise ValueError(
-        "scans are not mergeable: need identical wavelengths plus one "
-        "shared field axis (field merge), or identical field grids "
-        "(wavelength merge)")
-
-
 def _resolve_wavelengths(zos, wavelengths,
                          tol_um: float = 1e-5
                          ) -> tuple[list[int], list[float], list[int]]:
@@ -586,157 +915,7 @@ def _resolve_wavelengths(zos, wavelengths,
         values_um.append(lam)
     return indices, values_um, added
 
-
-def scan_image_plane(zos, config: FieldScanConfig) -> SpotScanResult:
-    """Trace ray bundles over the field grid and reduce to spot maps."""
-    ZOSAPI = zos.ZOSAPI
-    sd = zos.system.SystemData
-
-    # -- wavelengths -------------------------------------------------------
-    added_waves: list[int] = []
-    if config.wavelengths is None:
-        n_wave_def = sd.Wavelengths.NumberOfWavelengths
-        wave_indices = list(range(1, n_wave_def + 1))
-        wavelengths_um = [float(sd.Wavelengths.GetWavelength(w).Wavelength)
-                          for w in wave_indices]
-    else:
-        wave_indices, wavelengths_um, added_waves = _resolve_wavelengths(
-            zos, config.wavelengths
-        )
-
-    # -- geometry ----------------------------------------------------------
-    if config.normalization is not None:
-        set_field_normalization(zos, config.normalization)
-    field_unit, unit_name = _field_unit(zos)
-    x_ax = config.x_axis(field_unit)
-    y_ax = config.y_axis(field_unit)
-    to_norm = _field_normalizer(zos, x_ax, y_ax)
-    px, py = hexapolar_pupil(config.pupil_rings)
-    rays_per_point = px.size
-
-    lens_to_um = 1000.0  # lens units are mm for these systems
-    image_surf = zos.system.LDE.NumberOfSurfaces - 1
-    opd_none = getattr(ZOSAPI.Tools.RayTrace.OPDMode, "None")
-
-    n_points = x_ax.size * y_ax.size * len(wave_indices)
-    n_rays = n_points * rays_per_point
-    logger.info(
-        "scan: %d x %d field grid, %d wavelength(s), %d rays/point "
-        "-> %d rays total",
-        x_ax.size, y_ax.size, len(wave_indices), rays_per_point, n_rays,
-    )
-
-    # ray bookkeeping: rays are read back in the order they were added
-    jobs = [(iw, iy, ix)
-            for iw in range(len(wave_indices))
-            for iy in range(y_ax.size)
-            for ix in range(x_ax.size)]
-
-    sum_x = np.zeros((len(wave_indices), y_ax.size, x_ax.size))
-    sum_y = np.zeros_like(sum_x)
-    sum_r2 = np.zeros_like(sum_x)
-    n_valid = np.zeros_like(sum_x, dtype=int)
-    xy_store: list[list[tuple[int, float, float]]] = \
-        [[] for _ in range(y_ax.size * x_ax.size)]
-
-    # -- chunked batch trace -------------------------------------------------
-    chunk_pts = max(1, config.batch_chunk // rays_per_point)
-    pbar = tqdm(total=n_rays, unit="rays", unit_scale=True, desc="Raycasting", dynamic_ncols=True)
-    try:
-        for start in range(0, len(jobs), chunk_pts):
-            chunk = jobs[start:start + chunk_pts]
-            tool = zos.system.Tools.OpenBatchRayTrace()
-            try:
-                norm_unpol = tool.CreateNormUnpol(
-                    len(chunk) * rays_per_point,
-                    ZOSAPI.Tools.RayTrace.RaysType.Real, image_surf,
-                )
-                for iw, iy, ix in chunk:
-                    hx, hy = to_norm(x_ax[ix], y_ax[iy])
-                    for k in range(rays_per_point):
-                        norm_unpol.AddRay(wave_indices[iw], hx, hy,
-                                          float(px[k]), float(py[k]), opd_none)
-                logger.debug("scan: tracing rays %d..%d of %d ...",
-                             start * rays_per_point,
-                             (start + len(chunk)) * rays_per_point, n_rays)
-                pbar.update(len(chunk) * rays_per_point)
-                tool.RunAndWaitForCompletion()
-                norm_unpol.StartReadingResults()
-
-                reader, first = _make_ray_reader(norm_unpol)
-                res, fresh = first, False
-                for j, (iw, iy, ix) in enumerate(chunk):
-                    for _ in range(rays_per_point):
-                        if fresh:
-                            raw = reader()
-                            res = (bool(raw[0]), int(raw[1]), int(raw[2]),
-                                   int(raw[3]), float(raw[4]), float(raw[5]))
-                        fresh = True
-                        ok, _, err, vig, xr, yr = res
-                        if not ok:
-                            raise RuntimeError(
-                                "Batch ray trace returned fewer results than "
-                                "rays added."
-                            )
-                        if err == 0 and vig == 0:
-                            x_um, y_um = xr * lens_to_um, yr * lens_to_um
-                            sum_x[iw, iy, ix] += x_um
-                            sum_y[iw, iy, ix] += y_um
-                            n_valid[iw, iy, ix] += 1
-                            xy_store[iy * x_ax.size + ix].append(
-                                (iw, x_um, y_um))
-            finally:
-                tool.Close()
-
-    finally:
-        pbar.close()
-        # restore the prescription: remove wavelengths this scan added
-        for idx in sorted(added_waves, reverse=True):
-            zos.system.SystemData.Wavelengths.RemoveWavelength(idx)
-            logger.info("wavelengths: removed temporary table "
-                        "entry %d", idx)
-
-    # -- reduce: per-wavelength centroid + RMS ---------------------------------
-    with np.errstate(invalid="ignore", divide="ignore"):
-        cx = np.where(n_valid > 0, sum_x / n_valid, np.nan)
-        cy = np.where(n_valid > 0, sum_y / n_valid, np.nan)
-    rms = np.full_like(cx, np.nan)
-    rms_poly = np.full((y_ax.size, x_ax.size), np.nan)
-    for iy in range(y_ax.size):
-        for ix in range(x_ax.size):
-            pts = xy_store[iy * x_ax.size + ix]
-            if not pts:
-                continue
-            arr = np.asarray(pts)                      # (n, 3): iw, x, y
-            for iw in range(len(wave_indices)):
-                sel = arr[arr[:, 0] == iw]
-                if sel.size:
-                    dx = sel[:, 1] - cx[iw, iy, ix]
-                    dy = sel[:, 2] - cy[iw, iy, ix]
-                    rms[iw, iy, ix] = np.sqrt(np.mean(dx ** 2 + dy ** 2))
-            # polychromatic: pool all rays around a common centroid
-            dx = arr[:, 1] - arr[:, 1].mean()
-            dy = arr[:, 2] - arr[:, 2].mean()
-            rms_poly[iy, ix] = np.sqrt(np.mean(dx ** 2 + dy ** 2))
-
-    n_dead = int(np.sum(n_valid.sum(axis=0) == 0))
-    if n_dead:
-        logger.warning("scan: %d grid point(s) had no valid rays "
-                       "(vignetting or trace errors) -> NaN", n_dead)
-
-    return SpotScanResult(
-        x_field=x_ax, y_field=y_ax,
-        field_unit=field_unit, unit_name=unit_name,
-        wave_indices=wave_indices, wavelengths_um=wavelengths_um,
-        centroid_x_um=cx, centroid_y_um=cy,
-        rms_um=rms, rms_poly_um=rms_poly, n_valid=n_valid,
-        rays=(_rays_ndarray(xy_store, x_ax, y_ax)
-              if config.keep_rays else None),
-    )
-
-
-def _rays_ndarray(xy_store, x_ax: np.ndarray, y_ax: np.ndarray
-                  ) -> np.ndarray:
+def _rays_ndarray(xy_store, x_ax: np.ndarray, y_ax: np.ndarray) -> np.ndarray:
     """Flatten per-grid-point ray lists into one (N, 5) array carrying
     both the casting field coordinates and the landing positions."""
     chunks = []
@@ -803,7 +982,7 @@ def scan_spectral_lines(zos, wavelengths, slit_range=None,
                               keep_rays=keep_rays)
     else:
         raise ValueError(f"slit_axis must be 'x' or 'y', got {slit_axis!r}")
-    return scan_image_plane(zos, cfg)
+    return cfg.scan_image_plane(zos)
 
 
 def _wavelength_rgb(lam_um: float) -> tuple[float, float, float]:
@@ -1125,6 +1304,72 @@ def _warn_undersampled_shape(res: SpotScanResult, k: int,
         )
 
 
+def _image_secondary_coords(res: SpotScanResult, x_c: np.ndarray,
+                            y_c: np.ndarray, attrs: dict) -> dict:
+    """Non-dimension coordinates for the detector-image DataArray.
+
+    * field coordinate: the slit field angle/height mapped onto the image
+      dimension the slit runs along, via inverse interpolation of the
+      MEAN centroid relation (averaged over lines and slit-width
+      columns).  Per-line mappings differ by smile/keystone; the maximum
+      line-to-line spread is reported in attrs["field_coord_spread_mm"]
+      so the approximation is quantified, not hidden.  NaN outside the
+      mapped range.
+    * wavelength_nm: the dispersion solution along the dispersion image
+      dimension, interpolated between line centers (>= 2 lines needed);
+      NaN outside the outermost lines.
+    """
+    extra: dict = {}
+    # ---- slit field coordinate -------------------------------------------
+    slit_y = res.y_field.size >= res.x_field.size
+    sf = res.y_field if slit_y else res.x_field
+    if sf.size >= 2:
+        avg_axes = (0, 2) if slit_y else (0, 1)
+        px = np.nanmean(res.centroid_x_um, axis=avg_axes) / 1000.0
+        py = np.nanmean(res.centroid_y_um, axis=avg_axes) / 1000.0
+        pos, pix, dim = ((py, y_c, "y") if np.ptp(py) >= np.ptp(px)
+                         else (px, x_c, "x"))
+        d = np.diff(pos)
+        if np.all(d > 0) or np.all(d < 0):
+            p_srt, f_srt = ((pos, sf) if d[0] > 0
+                            else (pos[::-1], sf[::-1]))
+            vals = np.interp(pix, p_srt, f_srt)
+            vals[(pix < p_srt[0]) | (pix > p_srt[-1])] = np.nan
+            name = "field_y" if slit_y else "field_x"
+            extra[name] = (dim, vals)
+            # line-to-line spread of the mapping (smile/keystone)
+            per_line = (res.centroid_y_um if dim == "y"
+                        else res.centroid_x_um) / 1000.0
+            per_line = (per_line if slit_y
+                        else np.swapaxes(per_line, 1, 2))
+            spread = np.nanmax(np.nanmax(per_line, axis=(0, 2))
+                               - np.nanmin(per_line, axis=(0, 2)))
+            attrs["field_coord_units"] = res.unit_name
+            attrs["field_coord_dim"] = dim
+            attrs["field_coord_spread_mm"] = float(spread)
+        else:
+            logger.info("secondary coords: mean centroid not monotonic "
+                        "along the slit; field coordinate omitted")
+    # ---- wavelength coordinate -------------------------------------------
+    lx = np.asarray(attrs.get("line_x_mm", []), dtype=float)
+    ly = np.asarray(attrs.get("line_y_mm", []), dtype=float)
+    lam = np.asarray(attrs.get("wavelengths_nm", []), dtype=float)
+    good = np.isfinite(lx) & np.isfinite(ly)
+    if good.sum() >= 2:
+        lx, ly, lam = lx[good], ly[good], lam[good]
+        pos, pix, dim = ((lx, x_c, "x") if np.ptp(lx) >= np.ptp(ly)
+                         else (ly, y_c, "y"))
+        if np.unique(pos).size == pos.size:
+            order = np.argsort(pos)
+            vals = np.interp(pix, pos[order], lam[order])
+            vals[(pix < pos[order][0]) | (pix > pos[order][-1])] = np.nan
+            extra["wavelength_nm"] = (dim, vals)
+            attrs["wavelength_coord_dim"] = dim
+            attrs["wavelength_coord_note"] = (
+                "piecewise-linear between line centers; NaN outside")
+    return extra
+
+
 def plot_detector_image(da, annotate: bool = True,
                         savepath: Optional[str] = None, ax=None,
                         cmap: str = "inferno"):
@@ -1171,506 +1416,3 @@ def plot_detector_image(da, annotate: bool = True,
         fig.savefig(savepath, dpi=150)
         print(f"detector image saved to {savepath}")
     return fig, ax
-
-
-# ======================================================================
-# Self-test: mock ZOS-API implementing a paraxial lens + known blur
-# ======================================================================
-_MOCK_F_MM = 119.687     # focal length of the mock lens
-_MOCK_RMAX_DEG = 2.0     # maximum defined (radial) field of the mock
-_MOCK_S0_MM = 0.010      # blur slope: dx = s * Px, s = S0 * (1 + 2 r_n^2)
-_MOCK_DISP_MM = 0.5      # mock dispersion: x shift per wavelength number
-
-
-def _mock_blur_slope(hx: float, hy: float) -> float:
-    return _MOCK_S0_MM * (1.0 + 2.0 * (hx ** 2 + hy ** 2))
-
-
-def _build_mock_zos():
-    """A fake ZOSConnection wrapping an ideal thin lens with an injected,
-    field-dependent geometric blur — so scan results have closed-form
-    expected values."""
-
-    class Obj:
-        def __init__(self, **kw):
-            self.__dict__.update(kw)
-
-    class NormUnpol:
-        def __init__(self):
-            self.rays, self.i = [], 0
-
-        def AddRay(self, wave, hx, hy, px, py, opd):
-            self.rays.append((wave, hx, hy, px, py))
-
-        def StartReadingResults(self):
-            self.i = 0
-
-        def ReadNextResult(self):
-            wave, hx, hy, px, py = self.rays[self.i]
-            self.i += 1
-            s = _mock_blur_slope(hx, hy)
-            x = (_MOCK_F_MM * np.tan(np.deg2rad(hx * _MOCK_RMAX_DEG))
-                 + s * px + _MOCK_DISP_MM * (wave - 1))   # "grating"
-            y = _MOCK_F_MM * np.tan(np.deg2rad(hy * _MOCK_RMAX_DEG)) + s * py
-            return (True, self.i, 0, 0, x, y, 0, 0, 0, 1, 0, 0, 1, 0, 1)
-
-    class Tool:
-        def CreateNormUnpol(self, n, rays_type, surf):
-            return NormUnpol()
-
-        def RunAndWaitForCompletion(self):
-            pass
-
-        def Close(self):
-            pass
-
-    class Fields:
-        NumberOfFields = 2
-        Normalization = "Radial"
-
-        @staticmethod
-        def GetFieldType():
-            return "Angle"
-
-        @staticmethod
-        def GetField(i):
-            return (Obj(X=0.0, Y=0.0) if i == 1
-                    else Obj(X=0.0, Y=_MOCK_RMAX_DEG))
-
-    class Waves:
-        def __init__(self):
-            self._w = [0.55]
-
-        @property
-        def NumberOfWavelengths(self):
-            return len(self._w)
-
-        def GetWavelength(self, i):
-            return Obj(Wavelength=self._w[i - 1])
-
-        def AddWavelength(self, um, weight):
-            self._w.append(float(um))
-            return Obj(Wavelength=float(um))
-
-        def RemoveWavelength(self, i):
-            del self._w[i - 1]
-            return True
-
-    class ZOSAPI:
-        class SystemData:
-            FieldNormalizationType = Obj(Radial="Radial",
-                                         Rectangular="Rectangular")
-
-        class Tools:
-            class RayTrace:
-                RaysType = Obj(Real=0)
-                OPDMode = type("OPDMode", (), {"None": 0})
-
-    class MockZOS:
-        pass
-
-    mz = MockZOS()
-    mz.ZOSAPI = ZOSAPI
-    mz.system = Obj(
-        SystemData=Obj(Fields=Fields, Wavelengths=Waves()),
-        LDE=Obj(NumberOfSurfaces=7),
-        Tools=Obj(OpenBatchRayTrace=Tool),
-    )
-    return mz
-
-
-def self_test() -> None:
-    """Validate the scan pipeline against the mock (no OpticStudio).
-
-    Checks: centroid = f*tan(theta) to <1e-6 um, RMS matches the injected
-    blur analytically, chunked bookkeeping, interpolation, worst-field
-    location, normalization setter round-trip.
-    """
-    cfg = FieldScanConfig(
-        x_range=(-1 * u.deg, 1 * u.deg), n_x=5,
-        y_range=(-0.5 * u.deg, 0.5 * u.deg), n_y=7,
-        # 550 nm reuses the mock's 0.55 um table entry; 486 nm must be
-        # temporarily added and removed again
-        wavelengths=(550 * u.nm, 486 * u.nm),
-        pupil_rings=4,
-        batch_chunk=400,            # small -> forces multiple chunks
-        normalization="radial",     # exercises the setter path too
-    )
-    mock = _build_mock_zos()
-    res = scan_image_plane(mock, cfg)
-    assert res.wave_indices == [1, 2] and len(res.wavelengths_um) == 2
-    assert abs(res.wavelengths_um[1] - 0.486) < 1e-12
-    assert mock.system.SystemData.Wavelengths.NumberOfWavelengths == 1, \
-        "temporary wavelength was not removed"
-
-    px, py = hexapolar_pupil(4)
-    r2_mean = float(np.mean(px ** 2 + py ** 2))
-    ix, iy = 3, 5
-    exp_cx = _MOCK_F_MM * np.tan(np.deg2rad(res.x_field[ix])) * 1000.0
-    assert abs(res.centroid_x_um[0, iy, ix] - exp_cx) < 1e-6, "centroid"
-    hx = res.x_field[ix] / _MOCK_RMAX_DEG
-    hy = res.y_field[iy] / _MOCK_RMAX_DEG
-    exp_rms = _mock_blur_slope(hx, hy) * np.sqrt(r2_mean) * 1000.0
-    assert abs(res.rms_um[0, iy, ix] - exp_rms) / exp_rms < 1e-9, "RMS"
-    # dispersion: line centroids separated by _MOCK_DISP_MM per wave step
-    sep = res.centroid_x_um[1, iy, ix] - res.centroid_x_um[0, iy, ix]
-    assert abs(sep - _MOCK_DISP_MM * 1000.0) < 1e-6, "dispersion"
-    # pooled poly RMS = quadrature of per-line RMS and half-separation
-    exp_poly = np.sqrt(exp_rms ** 2 + (sep / 2.0) ** 2)
-    assert abs(res.rms_poly_um[iy, ix] - exp_poly) / exp_poly < 1e-9, \
-        "poly RMS with dispersion"
-    assert res.n_valid.min() == px.size == res.n_valid.max(), "bookkeeping"
-    assert abs(res.rms_at(res.x_field[ix] * u.deg, res.y_field[iy] * u.deg,
-                          wavelength=550 * u.nm)
-               - exp_rms) < 1e-9, "interpolation (single line)"
-    assert abs(res.rms_at(res.x_field[ix] * u.deg, res.y_field[iy] * u.deg)
-               - exp_poly) < 1e-9, "interpolation (polychromatic)"
-    assert abs(res.rms_at(res.x_field[ix] * u.deg, res.y_field[iy] * u.deg,
-                          wavelength=486 * u.nm)
-               - exp_rms) < 1e-9, "wavelength selection"
-    try:
-        res.rms_at(0 * u.deg, 0 * u.deg, wavelength=700 * u.nm)
-        raise AssertionError("unscanned wavelength not rejected")
-    except ValueError:
-        pass
-    wx, wy = res.worst_field()
-    assert (abs(abs(wx.value) - 1.0) < 1e-12
-            and abs(abs(wy.value) - 0.5) < 1e-12), "worst field"
-    mz = _build_mock_zos()
-    assert set_field_normalization(mz, "rectangular") == "Rectangular"
-    assert set_field_normalization(mz, "RADIAL") == "Radial"
-
-    # spectral-line scan: 1-D slit sweep, three "lines" on the detector
-    lines = scan_spectral_lines(
-        _build_mock_zos(),
-        wavelengths=(486 * u.nm, 550 * u.nm, 656 * u.nm),
-        slit_range=(-0.5 * u.deg, 0.5 * u.deg), n_slit=9,
-        slit_axis="y", pupil_rings=3,
-    )
-    assert lines.rms_um.shape == (3, 9, 1)
-    lx = np.nanmean(lines.centroid_x_um, axis=(1, 2))
-    exp_lx = _MOCK_DISP_MM * 1000.0 * (np.asarray(lines.wave_indices) - 1)
-    assert np.allclose(lx, exp_lx), "line positions on the detector"
-    import matplotlib
-    matplotlib.use("Agg", force=True)
-    fig, _ = plot_spectral_lines(lines, detector_mm=(14.19, 10.38))
-    assert len(fig.axes[0].lines) >= 3, "one curve per spectral line"
-
-    # true-spot-shape rendering: the mock spot is a uniformly scaled
-    # hexapolar disk (NOT a Gaussian); a single-point "line" rendered at
-    # fine pitch must reproduce the ray cloud's second moment, and the
-    # rays must be recoverable via rays_at.
-    one = scan_spectral_lines(
-        _build_mock_zos(), wavelengths=(550 * u.nm,),
-        slit_range=(0.2 * u.deg, 0.2 * u.deg), n_slit=1, pupil_rings=6,
-    )
-    cloud = one.rays_at(0, 0, 0)
-    assert cloud.shape == (127, 2), "rays_at"
-    da1 = one.to_image(pixel_pitch=2 * u.um)
-    img1 = np.asarray(da1.values)
-    assert da1.attrs["method"] == "rays" and da1.dims == ("y", "x")
-    assert abs(img1.sum() - 1.0) < 1e-12, "ray flux conservation"
-    pitch_mm = da1.attrs["pixel_pitch_um"] / 1000.0
-    xc = np.asarray(da1["x"].values, dtype=float)
-    col = img1.sum(axis=0)
-    mu = np.sum(xc * col) / col.sum()
-    var_img = np.sum((xc - mu) ** 2 * col) / col.sum()
-    var_rays = np.var(cloud[:, 0] / 1000.0)
-    # image variance = ray variance + pixel binning variance (pitch^2/12)
-    assert abs(var_img - (var_rays + pitch_mm ** 2 / 12.0)) \
-        < 0.02 * var_rays, "spot shape second moment"
-
-    # oversampled deposition: identical flux, same second moment
-    da_ov = one.to_image(pixel_pitch=2 * u.um, oversample=8)
-    img_ov = np.asarray(da_ov.values)
-    assert abs(img_ov.sum() - 1.0) < 1e-12, "oversampled flux"
-    assert img_ov.shape == img1.shape, "oversampling keeps native grid"
-
-    # non-uniform slit sampling (densified center)
-    pts = tuple(v * u.deg for v in
-                (-0.5, -0.3, -0.1, -0.05, 0.0, 0.05, 0.1, 0.3, 0.5))
-    nonuni = scan_spectral_lines(
-        _build_mock_zos(), wavelengths=(550 * u.nm,),
-        slit_points=pts, pupil_rings=3)
-    assert nonuni.y_field.size == 9
-    assert not np.allclose(np.diff(nonuni.y_field),
-                           np.diff(nonuni.y_field)[0]), "non-uniform axis"
-    assert np.all(np.isfinite(nonuni.rms_um)), "non-uniform scan traces"
-
-    # undersampling diagnostic: coarse slit over strong blur gradient
-    records = []
-    h = logging.Handler()
-    h.emit = lambda rec: records.append(rec.getMessage())
-    logger.addHandler(h)
-    try:
-        coarse = scan_spectral_lines(
-            _build_mock_zos(), wavelengths=(550 * u.nm,),
-            slit_range=(-1.9 * u.deg, 1.9 * u.deg), n_slit=3,
-            pupil_rings=3)
-        coarse.to_image(pixel_pitch=10 * u.um)
-    finally:
-        logger.removeHandler(h)
-    assert any("faster than the slit sampling" in m for m in records), \
-        "undersampling warning"
-
-    # finite slit width: a 2-D scan renders as parallel sub-curves with
-    # shared flux, not a raveled zigzag
-    wide = FieldScanConfig(
-        x_range=(-0.02 * u.deg, 0.02 * u.deg), n_x=3,
-        y_range=(-0.4 * u.deg, 0.4 * u.deg), n_y=9,
-        wavelengths=(550 * u.nm,), pupil_rings=3, keep_rays=True,
-        normalization="radial")
-    wres = scan_image_plane(_build_mock_zos(), wide)
-    da_w = wres.to_image(pixel_pitch=10 * u.um)
-    img_w = np.asarray(da_w.values)
-    assert abs(img_w.sum() - 1.0) < 1e-12, "2-D scan flux conservation"
-    # x footprint must span the three columns (~2*f*tan(0.02deg) ~ 84 um),
-    # far wider than a single column's spot alone
-    xs = np.asarray(da_w["x"].values, dtype=float)
-    prof = img_w.sum(axis=0)
-    lit = xs[prof > prof.max() * 1e-3]
-    assert (lit.max() - lit.min()) > 0.06, "slit width rendered"
-
-    # rays ndarray: field coords + landing positions per ray
-    r = nonuni.rays
-    assert isinstance(r, np.ndarray) and r.shape[1] == 5
-    assert set(np.round(np.unique(r[:, 2]), 6)) <= \
-        set(np.round(nonuni.y_field, 6)), "casting fields stored"
-    assert np.array_equal(nonuni.rays_at(0, 4, 0),
-                          r[(r[:, 0] == 0)
-                            & np.isclose(r[:, 2],
-                                         nonuni.y_field[4])][:, 3:5])
-
-    # concat: two half-slit scans == one full scan (field merge)
-    full_pts = tuple(v * u.deg for v in np.linspace(-0.5, 0.5, 9))
-    full = scan_spectral_lines(_build_mock_zos(),
-                               wavelengths=(550 * u.nm,),
-                               slit_points=full_pts, pupil_rings=3)
-    ha = scan_spectral_lines(_build_mock_zos(), wavelengths=(550 * u.nm,),
-                             slit_points=full_pts[:5], pupil_rings=3)
-    hb = scan_spectral_lines(_build_mock_zos(), wavelengths=(550 * u.nm,),
-                             slit_points=full_pts[5:], pupil_rings=3)
-    merged = concat_scans([hb, ha])         # out of order on purpose
-    assert np.allclose(merged.y_field, full.y_field)
-    assert np.allclose(merged.rms_um, full.rms_um)
-    assert np.allclose(merged.centroid_x_um, full.centroid_x_um)
-    assert merged.rays.shape[0] == full.rays.shape[0]
-    m_img = np.asarray(merged.to_image(pixel_pitch=25 * u.um).values)
-    f_img = np.asarray(full.to_image(pixel_pitch=25 * u.um).values)
-    assert np.allclose(m_img, f_img), "merged scan renders identically"
-
-    # concat: wavelength merge on the same grid
-    wa = scan_spectral_lines(_build_mock_zos(), wavelengths=(550 * u.nm,),
-                             slit_points=full_pts, pupil_rings=3)
-    wb = scan_spectral_lines(_build_mock_zos(), wavelengths=(486 * u.nm,),
-                             slit_points=full_pts, pupil_rings=3)
-    wl = concat_scans([wa, wb])
-    assert wl.rms_um.shape[0] == 2 and len(wl.wavelengths_um) == 2
-    sep = (np.nanmean(wl.centroid_x_um[1]) - np.nanmean(
-        wl.centroid_x_um[0]))
-    assert abs(sep - _MOCK_DISP_MM * 1000.0) < 1e-6, \
-        "wavelength-merged dispersion"
-    assert np.all(np.isfinite(wl.rms_poly_um)), "poly RMS from rays"
-
-    # persistence + in-memory composition: save both halves, load them,
-    # and concatenate with `+`; must equal the direct merge exactly
-    import tempfile, os
-    with tempfile.TemporaryDirectory() as td:
-        pa, pb = os.path.join(td, "a.npz"), os.path.join(td, "b.npz")
-        ha.save(pa)
-        hb.save(pb)
-        la, lb = SpotScanResult.load(pa), SpotScanResult.load(pb)
-        assert np.allclose(la.rms_um, ha.rms_um)
-        assert np.array_equal(la.rays, ha.rays)
-        assert la.unit_name == ha.unit_name
-        summed = lb + la                       # operator form
-        assert np.allclose(summed.rms_um, merged.rms_um)
-        assert np.allclose(summed.centroid_x_um, merged.centroid_x_um)
-        assert np.array_equal(np.sort(summed.rays, axis=0),
-                              np.sort(merged.rays, axis=0))
-        assert np.allclose(sum([la, lb]).rms_um, merged.rms_um)  # sum()
-
-    # detector offset: grid recenters, deposited flux pattern unchanged
-    # (mock spot sits at y ~= f*tan(0.2 deg) ~= 0.418 mm off the vertex)
-    da_off = one.to_image(pixel_pitch=2 * u.um, detector_mm=(0.5, 0.5),
-                          detector_center_mm=(0.05, 0.42))
-    xo = np.asarray(da_off["x"].values, dtype=float)
-    assert abs((xo[0] + xo[-1]) / 2.0 - 0.05) < 2e-3, "detector center"
-    assert abs(np.asarray(da_off.values).sum() - 1.0) < 1e-12, \
-        "flux on the offset detector"
-    # a detector centered on the vertex misses this off-axis spot
-    da_miss = one.to_image(pixel_pitch=2 * u.um, detector_mm=(0.2, 0.2))
-    assert np.asarray(da_miss.values).sum() < 1e-12, \
-        "spot correctly clipped off a vertex-centered detector"
-
-    # detector-image rendering: flux conservation + line positions
-    da = lines.to_image(pixel_pitch=25 * u.um)
-    img = np.asarray(da.values)
-    assert abs(img.sum() - 3.0) < 1e-3, "flux conservation (3 unit lines)"
-    xc = np.asarray(da["x"].values, dtype=float)          # pixel centers
-    col = img.sum(axis=0)
-    fig_img, _ = plot_detector_image(da)                  # plot layer
-    assert fig_img.axes, "plot_detector_image produced no axes"
-    exp_lx = _MOCK_DISP_MM * (np.asarray(lines.wave_indices) - 1)   # mm
-    for lx0 in exp_lx:
-        sel = np.abs(xc - lx0) < 0.2
-        cen = float(np.sum(xc[sel] * col[sel]) / np.sum(col[sel]))
-        assert abs(cen - lx0) < 25e-3 / 2, "line centroid on pixel grid"
-
-    print(f"self-test: centroid {res.centroid_x_um[0, iy, ix]:.3f} um, "
-          f"RMS {res.rms_um[0, iy, ix]:.4f} um "
-          f"(expected {exp_rms:.4f}), worst field "
-          f"({wx.value:g}, {wy.value:g}) deg")
-    print("self-test: ALL CHECKS PASSED")
-
-
-# ======================================================================
-# Command-line test program
-# ======================================================================
-def _print_report(res: SpotScanResult) -> None:
-    print(f"grid: {res.x_field.size} x {res.y_field.size} over "
-          f"x=[{res.x_field[0]:g}, {res.x_field[-1]:g}] deg, "
-          f"y=[{res.y_field[0]:g}, {res.y_field[-1]:g}] deg")
-    for k, w in enumerate(res.wave_indices):
-        r = res.rms_um[k]
-        print(f"wave {w} ({res.wavelengths_um[k]:.4f} um): RMS spot "
-              f"min {np.nanmin(r):.3f} / median {np.nanmedian(r):.3f} / "
-              f"max {np.nanmax(r):.3f} um")
-    rp = res.rms_poly_um
-    print(f"polychromatic: RMS spot min {np.nanmin(rp):.3f} / "
-          f"median {np.nanmedian(rp):.3f} / max {np.nanmax(rp):.3f} um")
-    wx, wy = res.worst_field()
-    print(f"worst field: ({wx.value:g}, {wy.value:g}) deg -> "
-          f"{np.nanmax(rp):.3f} um RMS")
-
-
-def _plot_report(res: SpotScanResult, path: str) -> None:
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(6.4, 4.8), dpi=300)
-    pcm = ax.pcolormesh(res.x_field, res.y_field, res.rms_poly_um,
-                        shading="auto", cmap="viridis")
-    fig.colorbar(pcm, ax=ax, label="polychromatic RMS spot radius [um]")
-    wx, wy = res.worst_field()
-    ax.plot(wx.value, wy.value, "r+", ms=12, mew=2, label="worst field")
-    ax.set_xlabel("field X [deg]")
-    ax.set_ylabel("field Y [deg]")
-    ax.set_title("Image-plane spot scan")
-    ax.legend(loc="best")
-    fig.tight_layout()
-    fig.savefig(path, dpi=300)
-    print(f"plot saved to {path}")
-
-
-def main(argv: Optional[list[str]] = None) -> None:
-    import argparse
-
-    ap = argparse.ArgumentParser(
-        description="Image-plane spot scan via ZOS-API batch ray tracing."
-    )
-    ap.add_argument("zemax_file", nargs="?",
-                    help=".zmx/.zos design (omit with --self-test)")
-    ap.add_argument("--self-test", action="store_true",
-                    help="validate against the built-in mock lens; "
-                    "no OpticStudio needed")
-    ap.add_argument("--x", type=float, nargs="+", default=[1.0],
-                    metavar="V",
-                    help="X field range: one value V -> [-V, +V], or two "
-                    "values LO HI (default: -1 1)")
-    ap.add_argument("--y", type=float, nargs="+", default=[0.5],
-                    metavar="V",
-                    help="Y field range: one value V -> [-V, +V], or two "
-                    "values LO HI (default: -0.5 0.5)")
-    ap.add_argument("--nx", type=int, default=20)
-    ap.add_argument("--ny", type=int, default=30)
-    ap.add_argument("--rings", type=int, default=6,
-                    help="hexapolar pupil rings (default 6 -> 127 rays)")
-    ap.add_argument("--waves", type=float, nargs="*", default=None,
-                    metavar="NM",
-                    help="wavelengths in nm, e.g. --waves 486.1 550 656.3 "
-                    "(default: all wavelengths defined in the file)")
-    ap.add_argument("--normalization", choices=["radial", "rectangular"],
-                    default=None, help="set field normalization first")
-    ap.add_argument("--plot", metavar="PNG",
-                    help="save a polychromatic RMS map to this file")
-    ap.add_argument("--lines", metavar="PNG",
-                    help="spectrograph mode: save the spectral lines as "
-                    "they land on the image plane (use with --waves and "
-                    "a slit-like grid, e.g. --nx 1)")
-    ap.add_argument("--detector", type=float, nargs=2, default=None,
-                    metavar=("W_MM", "H_MM"),
-                    help="detector outline for --lines / extent for "
-                    "--image (IMX267: 14.19 10.38)")
-    ap.add_argument("--oversample", type=int, default=4, metavar="N",
-                    help="sub-pixel deposition factor for --image "
-                    "(anti-aliasing of sharp lines; default 4)")
-    ap.add_argument("--pitch", type=float, default=None, metavar="UM",
-                    help="detector pixel pitch in um (IMX267: 3.45); "
-                    "required with --image")
-    ap.add_argument("--image", metavar="PNG",
-                    help="spectrograph mode: render the lines as a "
-                    "pixel-sampled detector intensity image, spot flux "
-                    "distributed over pixels")
-    ap.add_argument("--debug", action="store_true")
-    args = ap.parse_args(argv)
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="[%(asctime)s] %(name)s: %(message)s", datefmt="%H:%M:%S",
-    )
-
-    if args.self_test:
-        self_test()
-        return
-    if not args.zemax_file:
-        ap.error("provide a Zemax file, or use --self-test")
-
-    def to_range(vals, name):
-        if len(vals) == 1:
-            return (-vals[0] * u.deg, vals[0] * u.deg)
-        if len(vals) == 2:
-            return (vals[0] * u.deg, vals[1] * u.deg)
-        ap.error(f"--{name} takes one value (+/-V) or two (LO HI)")
-
-    cfg = FieldScanConfig(
-        x_range=to_range(args.x, "x"), n_x=args.nx,
-        y_range=to_range(args.y, "y"), n_y=args.ny,
-        wavelengths=(None if args.waves is None
-                     else tuple(w * u.nm for w in args.waves)),
-        pupil_rings=args.rings,
-        normalization=args.normalization,
-        keep_rays=bool(args.image),   # true spot shapes for --image
-    )
-    # try:
-    #     from .zemax_iface import ZOSConnection   # inside the package
-    # except ImportError:
-    #     from zemax_iface import ZOSConnection    # run as a plain script
-    from astro_snr_calc.zemax_iface import ZOSConnection
-
-    zos = ZOSConnection()
-    try:
-        zos.load(str(args.zemax_file))
-        res = scan_image_plane(zos, cfg)
-    finally:
-        zos.close()
-
-    _print_report(res)
-    if args.plot:
-        _plot_report(res, args.plot)
-    if args.lines:
-        plot_spectral_lines(res, savepath=args.lines,
-                            detector_mm=(tuple(args.detector)
-                                         if args.detector else None))
-    if args.image:
-        if args.pitch is None:
-            ap.error("--image requires --pitch (um)")
-        da = res.to_image(
-            pixel_pitch=args.pitch * u.um,
-            detector_mm=(tuple(args.detector) if args.detector else None),
-            oversample=args.oversample,
-        )
-        plot_detector_image(da, savepath=args.image)
-
-
-if __name__ == "__main__":
-    main()
