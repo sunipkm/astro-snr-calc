@@ -13,6 +13,8 @@ from .snr_calculator import (
     Telescope,
 )
 
+from .version import __version__
+
 __all__ = [
     "DetectorPSF",
     "ExposureGrid",
@@ -24,4 +26,5 @@ __all__ = [
     "SNRModel",
     "SNRResult",
     "Telescope",
+    "__version__",
 ]

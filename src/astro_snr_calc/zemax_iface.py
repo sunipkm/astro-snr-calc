@@ -34,6 +34,7 @@ SampleSize = Literal[
     "S_2048x2048", "S_4096x4096", "S_8192x8192",
 ]
 
+
 @validate_units
 @dataclass(frozen=True)
 class ZemaxConfig:
@@ -43,13 +44,14 @@ class ZemaxConfig:
     # field point at which to evaluate the PSF.
     # This is 1-based, as in Zemax; the default of None means "all fields" and is handled by the SNRModel builder.
     field_index: Optional[int] = field(
-        default=None, 
+        default=None,
         metadata={
             'description': '1-based field index in the Zemax prescription; None means "all fields"'
-            }
-        )
+        }
+    )
     wave_index: int = 1          # wavelength number in the Zemax file
-    image_delta: u.Quantity = 0.5 * u.um  # Huygens PSF image-plane sampling [um]
+    # Huygens PSF image-plane sampling [um]
+    image_delta: u.Quantity = 0.5 * u.um
     throughput: float = 0.95     # bulk+coating transmission
     # PSF computation method:
     #   "huygens" - accurate for any system, but brute-force slow
@@ -70,13 +72,13 @@ class ZemaxConfig:
     connect_as_extension: bool = False
 
     def __post_init__(self):
-        filp = Path(self.zemax_file).absolute()
-        if not filp.is_file():
+        fpath = Path(self.zemax_file).absolute()
+        if not fpath.is_file():
             raise FileNotFoundError(
-                f"Zemax file not found: {filp!r} - "
+                f"Zemax file not found: {fpath!r} - "
                 f"the ZOS-API LoadFile would fail silently, so stopping here."
             )
-        object.__setattr__(self, 'zemax_file', filp)
+        object.__setattr__(self, 'zemax_file', fpath)
 
     def build(
         self,
@@ -99,7 +101,7 @@ class ZemaxConfig:
         zos = ZOSConnection(connect_as_extension=self.connect_as_extension)
         models: list[tuple[str, SNRModel]] = []
         try:
-            zos.load(str(self.zemax_file))
+            zos.load(self.zemax_file)
             logger.debug(
                 "build: extracting first-order properties (EPD/EFFL/WFNO) ...")
             telescope = zos.build(
@@ -208,18 +210,17 @@ class ZOSConnection:
         self.system = self.app.PrimarySystem
         logger.debug("ZOSConnection: PrimarySystem acquired")
 
-    def load(self, path: str):
-        import os
-        if not os.path.isfile(path):
+    def load(self, path: Path):
+        if not path.is_file():
             raise FileNotFoundError(
                 f"Zemax file not found: {path!r} - LoadFile would fail "
                 f"silently, so stopping here."
             )
         logger.debug(
             f"ZOSConnection: LoadFile({path}) "
-            f"[{os.path.getsize(path)} bytes] ..."
+            f"[{path.stat().st_size} bytes] ..."
         )
-        ok = self.system.LoadFile(path, False)
+        ok = self.system.LoadFile(str(path), False)
         logger.debug(f"ZOSConnection: LoadFile returned {ok}")
         if not ok:
             raise RuntimeError(
@@ -301,7 +302,7 @@ class ZOSConnection:
     ) -> DetectorPSF:
         """Run a PSF analysis (Huygens or FFT, per `config`) and bin onto
         the detector pixel grid."""
-        if pixel_size.unit.physical_type != 'length': # type: ignore
+        if pixel_size.unit.physical_type != 'length':  # type: ignore
             raise ValueError(
                 f"pixel_size must be a length quantity, got {pixel_size}"
             )

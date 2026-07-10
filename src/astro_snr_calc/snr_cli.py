@@ -10,7 +10,7 @@ drive the PSF computation via the ZOS-API.
 import sys
 import logging
 
-from astro_snr_calc.snr_calculator import (
+from .snr_calculator import (
     ExposureGrid, PhotometricBand,
     SNRResult, Sensor,
     SkyBrightness, Telescope,
@@ -119,7 +119,7 @@ def main():
         )
         models = [("Analytic (on-axis)", model)]
     elif sys.platform == "win32" and zemax_file is not None:
-        from astro_snr_calc.zemax_iface import ZemaxConfig
+        from .zemax_iface import ZemaxConfig
         config = ZemaxConfig(
             zemax_file=zemax_file,
             pupil_sampling=args.pupil_sampling,
@@ -170,7 +170,8 @@ def main():
         print(
             "Plots were generated but not shown due to --no-plots flag. "
             "Saved plot files: "
-            + ", ".join(f"{stem}_field{k}.png" for k in range(1, len(models) + 1))
+            + ", ".join(f"{stem}_field{k}.png" for k in range(1,
+                        len(models) + 1))
         )
 
 
