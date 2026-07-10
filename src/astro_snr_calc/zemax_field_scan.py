@@ -138,6 +138,32 @@ class SpotScanResult:
     # (wave_position, x_um, y_um).
     rays: Optional[list] = None
 
+    def to_image(self, pixel_pitch: u.Quantity,
+                 detector_mm: Optional[tuple[float, float]] = None,
+                 method: str = "auto",
+                 detector_center_mm: tuple[float, float] = (0.0, 0.0)):
+        """Render the spectral lines onto a pixel grid -> xarray.DataArray.
+
+        Pure computation, no plotting: dims ("y", "x") with pixel-center
+        coordinates in mm, values = flux per pixel as a fraction of each
+        (unit-flux) line.  Metadata in .attrs: pixel_pitch_um, method,
+        wavelengths_nm, and per-line center positions (line_x_mm,
+        line_y_mm) for annotation.  Pass the result to
+        `plot_detector_image`, or use xarray directly (da.plot(),
+        da.sel(...), da.to_netcdf(...)).
+
+        See `_render_image` for the method semantics ("rays" true spot
+        shapes / "gaussian" approximation / "auto").
+        """
+        import xarray as xr
+
+        image, x_c, y_c, attrs = _render_image(self, pixel_pitch,
+                                               detector_mm, method,
+                                               detector_center_mm)
+        return xr.DataArray(image, dims=("y", "x"),
+                            coords={"x": x_c, "y": y_c},
+                            attrs=attrs, name="flux")
+
     def rays_at(self, wave_pos: int, iy: int, ix: int) -> np.ndarray:
         """(n, 2) ray landing coordinates [um] for one grid point/line."""
         if self.rays is None:
@@ -477,12 +503,12 @@ def scan_image_plane(zos, config: FieldScanConfig) -> SpotScanResult:
                 tool.Close()
 
     finally:
+        pbar.close()
         # restore the prescription: remove wavelengths this scan added
         for idx in sorted(added_waves, reverse=True):
             zos.system.SystemData.Wavelengths.RemoveWavelength(idx)
             logger.info("wavelengths: removed temporary table "
                         "entry %d", idx)
-    pbar.close()
 
     # -- reduce: per-wavelength centroid + RMS ---------------------------------
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -654,33 +680,32 @@ def plot_spectral_lines(res: SpotScanResult, savepath: Optional[str] = None,
     return fig, ax
 
 
-def render_detector_image(res: SpotScanResult, pixel_pitch: u.Quantity,
-                          detector_mm: Optional[tuple[float, float]] = None,
-                          method: str = "auto", annotate: bool = True,
-                          savepath: Optional[str] = None, ax=None,
-                          cmap: str = "inferno"):
-    """Render the spectral lines as a simulated detector image.
+def _render_image(res: SpotScanResult, pixel_pitch: u.Quantity,
+                  detector_mm: Optional[tuple[float, float]] = None,
+                  method: str = "auto",
+                  detector_center_mm: tuple[float, float] = (0.0, 0.0)):
+    """Compute the detector image (no plotting).
 
-    A pixel grid at `pixel_pitch` is laid over the image plane (covering
-    `detector_mm`=(width, height) centered on axis, or auto-sized to the
-    lines plus margin).  Each line is normalized to unit total flux with
-    uniform illumination along the slit, and its center is annotated with
-    the wavelength (color encodes brightness, not wavelength).
+    Coordinate convention: all positions are in the Zemax image surface's
+    LOCAL frame, origin at the surface vertex (the batch-ray X/Y, i.e.
+    the Footprint Diagram convention — not the chief-ray-relative Spot
+    Diagram convention).  `detector_mm` places the pixel grid centered on
+    `detector_center_mm` (default: the vertex); use the offset when the
+    physical detector is mounted off the image-surface vertex.
+
+    Returns (image, x_centers_mm, y_centers_mm, attrs); image is
+    (n_pix_y, n_pix_x), row 0 at min y.
 
     method:
-      "rays"     true spot shapes: the traced ray landing coordinates are
-                 deposited onto the pixels.  Between scanned slit samples
+      "rays"     true spot shapes: traced ray landing coordinates are
+                 deposited onto the pixels; between scanned slit samples
                  the two neighboring ray clouds are re-centered onto the
-                 interpolated centroid and cross-faded, so line position
-                 varies smoothly while coma tails, astigmatic elongation,
-                 and other real spot structure are preserved.  Requires a
-                 scan with keep_rays=True.
+                 interpolated centroid and cross-faded, preserving coma
+                 tails, astigmatic elongation, and other real structure.
+                 Requires a scan with keep_rays=True.
       "gaussian" analytic approximation: sigma = RMS/sqrt(2), integrated
                  over pixel boundaries (per-axis erf).
       "auto"     "rays" when ray data is present, else "gaussian".
-
-    Returns (image, (x_min, x_max, y_min, y_max) [mm], fig, ax); image is
-    (n_pix_y, n_pix_x), row 0 at y_min.
     """
     if method == "auto":
         method = "rays" if res.rays is not None else "gaussian"
@@ -717,7 +742,9 @@ def render_detector_image(res: SpotScanResult, pixel_pitch: u.Quantity,
     # pixel-grid extent
     if detector_mm is not None:
         dw, dh = detector_mm
-        x_min, x_max, y_min, y_max = -dw / 2, dw / 2, -dh / 2, dh / 2
+        cx0, cy0 = detector_center_mm
+        x_min, x_max = cx0 - dw / 2, cx0 + dw / 2
+        y_min, y_max = cy0 - dh / 2, cy0 + dh / 2
     else:
         allx = np.concatenate([L[0] for L in lines if L is not None])
         ally = np.concatenate([L[1] for L in lines if L is not None])
@@ -795,35 +822,69 @@ def render_detector_image(res: SpotScanResult, pixel_pitch: u.Quantity,
                     deposit(cloud[:, 0] + cxf[j], cloud[:, 1] + cyf[j],
                             flux * wgt / cloud.shape[0])
 
-    # plot
+    x_centers = x_min + (np.arange(n_px) + 0.5) * pitch_mm
+    y_centers = y_min + (np.arange(n_py) + 0.5) * pitch_mm
+    attrs = {
+        "units": "fraction of line flux per pixel",
+        "pixel_pitch_um": float(pixel_pitch.to(u.um).value),
+        "method": method,
+        "wavelengths_nm": [lam * 1000.0 for lam in res.wavelengths_um],
+        "line_x_mm": [float(np.mean(L[0])) if L is not None else np.nan
+                      for L in lines],
+        "line_y_mm": [float(np.mean(L[1])) if L is not None else np.nan
+                      for L in lines],
+        "detector_center_mm": list(detector_center_mm),
+        "origin": "Zemax image-surface vertex (local frame)",
+    }
+    return image, x_centers, y_centers, attrs
+
+
+def plot_detector_image(da, annotate: bool = True,
+                        savepath: Optional[str] = None, ax=None,
+                        cmap: str = "inferno"):
+    """Plot a detector image produced by SpotScanResult.to_image().
+
+    Pure presentation: all data and metadata come from the DataArray
+    (values, x/y pixel-center coordinates in mm, and .attrs).  For quick
+    looks, xarray's own da.plot() also works; this adds equal aspect,
+    correct pixel extent, and wavelength annotations at line centers.
+    """
     import matplotlib.pyplot as plt
+
+    x_c = np.asarray(da["x"].values, dtype=float)
+    y_c = np.asarray(da["y"].values, dtype=float)
+    pitch = float(da.attrs.get("pixel_pitch_um", 0.0)) / 1000.0
+    half = pitch / 2.0 if pitch else 0.0
+    extent = (x_c[0] - half, x_c[-1] + half, y_c[0] - half, y_c[-1] + half)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(9, 6.5))
     else:
         fig = ax.figure
-    im = ax.imshow(image, origin="lower", cmap=cmap,
-                   extent=(x_min, x_max, y_min, y_max), aspect="equal",
-                   interpolation="nearest")
-    fig.colorbar(im, ax=ax, label="flux per pixel [fraction of line]")
+    im = ax.imshow(np.asarray(da.values), origin="lower", cmap=cmap,
+                   extent=extent, aspect="equal", interpolation="nearest")
+    fig.colorbar(im, ax=ax,
+                 label=da.attrs.get("units", "flux per pixel"))
     if annotate:
-        for k, L in enumerate(lines):
-            if L is None:
-                continue
-            ax.annotate(f"{res.wavelengths_um[k] * 1000.0:.1f} nm",
-                        xy=(float(np.mean(L[0])), float(np.mean(L[1]))),
-                        xytext=(6, 0), textcoords="offset points",
-                        color="w", fontsize=8, ha="left", va="center",
-                        rotation=90)
+        lams = da.attrs.get("wavelengths_nm", [])
+        lxs = da.attrs.get("line_x_mm", [])
+        lys = da.attrs.get("line_y_mm", [])
+        for lam, lx, ly in zip(lams, lxs, lys):
+            if np.isfinite(lx) and np.isfinite(ly):
+                ax.annotate(f"{lam:.1f} nm", xy=(lx, ly),
+                            xytext=(6, 0), textcoords="offset points",
+                            color="w", fontsize=8, ha="left",
+                            va="center", rotation=90)
     ax.set_xlabel("image plane X [mm]")
     ax.set_ylabel("image plane Y [mm]")
     ax.set_title(f"Simulated detector image "
-                 f"({pixel_pitch.to(u.um).value:g} um pixels, {method})")
+                 f"({da.attrs.get('pixel_pitch_um', '?')} um pixels, "
+                 f"{da.attrs.get('method', '?')})")
     fig.tight_layout()
     if savepath:
         fig.savefig(savepath, dpi=150)
         print(f"detector image saved to {savepath}")
-    return image, (x_min, x_max, y_min, y_max), fig, ax
+    return fig, ax
 
 
 # ======================================================================
@@ -1019,11 +1080,12 @@ def self_test() -> None:
     )
     cloud = one.rays_at(0, 0, 0)
     assert cloud.shape == (127, 2), "rays_at"
-    img1, (x0, x1, y0, y1), _, _ = render_detector_image(
-        one, pixel_pitch=2 * u.um, annotate=False)
+    da1 = one.to_image(pixel_pitch=2 * u.um)
+    img1 = np.asarray(da1.values)
+    assert da1.attrs["method"] == "rays" and da1.dims == ("y", "x")
     assert abs(img1.sum() - 1.0) < 1e-12, "ray flux conservation"
-    pitch_mm = 2e-3
-    xc = x0 + (np.arange(img1.shape[1]) + 0.5) * pitch_mm
+    pitch_mm = da1.attrs["pixel_pitch_um"] / 1000.0
+    xc = np.asarray(da1["x"].values, dtype=float)
     col = img1.sum(axis=0)
     mu = np.sum(xc * col) / col.sum()
     var_img = np.sum((xc - mu) ** 2 * col) / col.sum()
@@ -1032,13 +1094,27 @@ def self_test() -> None:
     assert abs(var_img - (var_rays + pitch_mm ** 2 / 12.0)) \
         < 0.02 * var_rays, "spot shape second moment"
 
+    # detector offset: grid recenters, deposited flux pattern unchanged
+    # (mock spot sits at y ~= f*tan(0.2 deg) ~= 0.418 mm off the vertex)
+    da_off = one.to_image(pixel_pitch=2 * u.um, detector_mm=(0.5, 0.5),
+                          detector_center_mm=(0.05, 0.42))
+    xo = np.asarray(da_off["x"].values, dtype=float)
+    assert abs((xo[0] + xo[-1]) / 2.0 - 0.05) < 2e-3, "detector center"
+    assert abs(np.asarray(da_off.values).sum() - 1.0) < 1e-12, \
+        "flux on the offset detector"
+    # a detector centered on the vertex misses this off-axis spot
+    da_miss = one.to_image(pixel_pitch=2 * u.um, detector_mm=(0.2, 0.2))
+    assert np.asarray(da_miss.values).sum() < 1e-12, \
+        "spot correctly clipped off a vertex-centered detector"
+
     # detector-image rendering: flux conservation + line positions
-    img, (x0, x1, y0, y1), _, _ = render_detector_image(
-        lines, pixel_pitch=25 * u.um, annotate=False)
+    da = lines.to_image(pixel_pitch=25 * u.um)
+    img = np.asarray(da.values)
     assert abs(img.sum() - 3.0) < 1e-3, "flux conservation (3 unit lines)"
-    n_px = img.shape[1]
-    xc = (np.arange(n_px) + 0.5) * (x1 - x0) / n_px + x0   # pixel centers
+    xc = np.asarray(da["x"].values, dtype=float)          # pixel centers
     col = img.sum(axis=0)
+    fig_img, _ = plot_detector_image(da)                  # plot layer
+    assert fig_img.axes, "plot_detector_image produced no axes"
     exp_lx = _MOCK_DISP_MM * (np.asarray(lines.wave_indices) - 1)   # mm
     for lx0 in exp_lx:
         sel = np.abs(xc - lx0) < 0.2
@@ -1189,11 +1265,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.image:
         if args.pitch is None:
             ap.error("--image requires --pitch (um)")
-        render_detector_image(
-            res, pixel_pitch=args.pitch * u.um,
+        da = res.to_image(
+            pixel_pitch=args.pitch * u.um,
             detector_mm=(tuple(args.detector) if args.detector else None),
-            savepath=args.image,
         )
+        plot_detector_image(da, savepath=args.image)
 
 
 if __name__ == "__main__":
