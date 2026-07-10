@@ -78,6 +78,9 @@ class FieldScanConfig:
     pupil_rings: int = 6
     # Rays per batch-trace run (chunked to bound .NET memory).
     batch_chunk: int = 200_000
+    # Keep the individual ray landing coordinates in the result (needed
+    # for true-spot-shape detector rendering; small memory cost).
+    keep_rays: bool = False
     # Field normalization to apply before scanning: "radial",
     # "rectangular", or None to leave the prescription as-is.  With
     # rectangular normalization the scan range only needs to fit the
@@ -130,6 +133,18 @@ class SpotScanResult:
     rms_um: np.ndarray                # (n_wave, n_y, n_x) RMS spot radius
     rms_poly_um: np.ndarray           # (n_y, n_x) polychromatic
     n_valid: np.ndarray               # (n_wave, n_y, n_x) rays used
+    # Optional per-ray landing coordinates (keep_rays=True): a list of
+    # length n_y*n_x (row-major); each entry is an (n, 3) array of
+    # (wave_position, x_um, y_um).
+    rays: Optional[list] = None
+
+    def rays_at(self, wave_pos: int, iy: int, ix: int) -> np.ndarray:
+        """(n, 2) ray landing coordinates [um] for one grid point/line."""
+        if self.rays is None:
+            raise ValueError("scan was run without keep_rays=True")
+        arr = self.rays[iy * self.x_field.size + ix]
+        sel = arr[arr[:, 0] == wave_pos]
+        return sel[:, 1:3]
 
     # ---- interpolation ---------------------------------------------------
     def _wave_pos(self, wavelength: u.Quantity, tol_um: float = 1e-3) -> int:
@@ -414,8 +429,9 @@ def scan_image_plane(zos, config: FieldScanConfig) -> SpotScanResult:
 
     # -- chunked batch trace -------------------------------------------------
     chunk_pts = max(1, config.batch_chunk // rays_per_point)
+    pbar = tqdm(total=n_rays, unit="rays", unit_scale=True, desc="Raycasting", dynamic_ncols=True)
     try:
-        for start in tqdm(range(0, len(jobs), chunk_pts)):
+        for start in range(0, len(jobs), chunk_pts):
             chunk = jobs[start:start + chunk_pts]
             tool = zos.system.Tools.OpenBatchRayTrace()
             try:
@@ -431,6 +447,7 @@ def scan_image_plane(zos, config: FieldScanConfig) -> SpotScanResult:
                 logger.debug("scan: tracing rays %d..%d of %d ...",
                              start * rays_per_point,
                              (start + len(chunk)) * rays_per_point, n_rays)
+                pbar.update(len(chunk) * rays_per_point)
                 tool.RunAndWaitForCompletion()
                 norm_unpol.StartReadingResults()
 
@@ -465,6 +482,7 @@ def scan_image_plane(zos, config: FieldScanConfig) -> SpotScanResult:
             zos.system.SystemData.Wavelengths.RemoveWavelength(idx)
             logger.info("wavelengths: removed temporary table "
                         "entry %d", idx)
+    pbar.close()
 
     # -- reduce: per-wavelength centroid + RMS ---------------------------------
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -500,6 +518,8 @@ def scan_image_plane(zos, config: FieldScanConfig) -> SpotScanResult:
         wave_indices=wave_indices, wavelengths_um=wavelengths_um,
         centroid_x_um=cx, centroid_y_um=cy,
         rms_um=rms, rms_poly_um=rms_poly, n_valid=n_valid,
+        rays=([np.asarray(pts).reshape(-1, 3) for pts in xy_store]
+              if config.keep_rays else None),
     )
 
 
@@ -510,7 +530,8 @@ def scan_spectral_lines(zos, wavelengths, slit_range, n_slit: int = 41,
                         slit_axis: str = "y",
                         cross_field: Optional[u.Quantity] = None,
                         pupil_rings: int = 4,
-                        normalization: Optional[str] = None
+                        normalization: Optional[str] = None,
+                        keep_rays: bool = True
                         ) -> SpotScanResult:
     """Scan spectral lines: 1-D field sweep along the slit x wavelengths.
 
@@ -533,13 +554,15 @@ def scan_spectral_lines(zos, wavelengths, slit_range, n_slit: int = 41,
                               y_range=slit_range, n_y=n_slit,
                               wavelengths=tuple(wavelengths),
                               pupil_rings=pupil_rings,
-                              normalization=normalization)
+                              normalization=normalization,
+                              keep_rays=keep_rays)
     elif slit_axis == "x":
         cfg = FieldScanConfig(x_range=slit_range, n_x=n_slit,
                               y_range=(cross, cross), n_y=1,
                               wavelengths=tuple(wavelengths),
                               pupil_rings=pupil_rings,
-                              normalization=normalization)
+                              normalization=normalization,
+                              keep_rays=keep_rays)
     else:
         raise ValueError(f"slit_axis must be 'x' or 'y', got {slit_axis!r}")
     return scan_image_plane(zos, cfg)
@@ -633,61 +656,78 @@ def plot_spectral_lines(res: SpotScanResult, savepath: Optional[str] = None,
 
 def render_detector_image(res: SpotScanResult, pixel_pitch: u.Quantity,
                           detector_mm: Optional[tuple[float, float]] = None,
-                          annotate: bool = True,
+                          method: str = "auto", annotate: bool = True,
                           savepath: Optional[str] = None, ax=None,
                           cmap: str = "inferno"):
     """Render the spectral lines as a simulated detector image.
 
     A pixel grid at `pixel_pitch` is laid over the image plane (covering
     `detector_mm`=(width, height) centered on axis, or auto-sized to the
-    lines plus margin).  Each line's centroid curve and RMS width are
-    interpolated onto fine samples along the slit, and every sample
-    deposits its flux onto the pixels it covers, modeling the spot as a
-    Gaussian with sigma = RMS/sqrt(2) integrated analytically over pixel
-    boundaries (per-axis erf).  Brightness therefore reflects how each
-    spot's energy is shared between pixels: wider spots are dimmer and
-    broader.  Each line is normalized to unit total flux, and its center
-    is annotated with the wavelength.
+    lines plus margin).  Each line is normalized to unit total flux with
+    uniform illumination along the slit, and its center is annotated with
+    the wavelength (color encodes brightness, not wavelength).
+
+    method:
+      "rays"     true spot shapes: the traced ray landing coordinates are
+                 deposited onto the pixels.  Between scanned slit samples
+                 the two neighboring ray clouds are re-centered onto the
+                 interpolated centroid and cross-faded, so line position
+                 varies smoothly while coma tails, astigmatic elongation,
+                 and other real spot structure are preserved.  Requires a
+                 scan with keep_rays=True.
+      "gaussian" analytic approximation: sigma = RMS/sqrt(2), integrated
+                 over pixel boundaries (per-axis erf).
+      "auto"     "rays" when ray data is present, else "gaussian".
 
     Returns (image, (x_min, x_max, y_min, y_max) [mm], fig, ax); image is
     (n_pix_y, n_pix_x), row 0 at y_min.
     """
-    from scipy.special import erf
+    if method == "auto":
+        method = "rays" if res.rays is not None else "gaussian"
+    if method == "rays" and res.rays is None:
+        raise ValueError("method='rays' needs a scan with keep_rays=True")
+    if method not in ("rays", "gaussian"):
+        raise ValueError(f"unknown method {method!r}")
 
     pitch_mm = pixel_pitch.to(u.um).value / 1000.0
     n_lines = len(res.wavelengths_um)
+    n_x = res.x_field.size
 
-    # per-line fine-sampled centroid curves (interpolated along the slit)
-    curves = []
+    # per-line data along the slit: centroids [mm], widths [mm], and (for
+    # method="rays") the ray clouds relative to their centroid [mm]
+    lines = []
     for k in range(n_lines):
-        cx = res.centroid_x_um[k].ravel() / 1000.0    # mm
+        cx = res.centroid_x_um[k].ravel() / 1000.0
         cy = res.centroid_y_um[k].ravel() / 1000.0
         w = res.rms_um[k].ravel() / 1000.0
         good = np.isfinite(cx) & np.isfinite(cy) & np.isfinite(w)
-        cx, cy, w = cx[good], cy[good], w[good]
-        if cx.size == 0:
-            curves.append(None)
+        idx = np.nonzero(good)[0]
+        if idx.size == 0:
+            lines.append(None)
             continue
-        if cx.size == 1:
-            curves.append((cx, cy, w))
-            continue
-        # arc-length parameterization, resampled at ~pitch/2 steps
-        ds = np.hypot(np.diff(cx), np.diff(cy))
-        t = np.concatenate(([0.0], np.cumsum(ds)))
-        n_fine = max(cx.size, int(np.ceil(t[-1] / (pitch_mm / 2.0))) + 1)
-        tf = np.linspace(0.0, t[-1], n_fine)
-        curves.append((np.interp(tf, t, cx), np.interp(tf, t, cy),
-                       np.interp(tf, t, w)))
+        clouds = None
+        if method == "rays":
+            clouds = []
+            for flat in idx:
+                iy, ix = divmod(int(flat), n_x)
+                r = res.rays_at(k, iy, ix) / 1000.0          # mm
+                clouds.append(r - [cx[flat], cy[flat]])      # centered
+        lines.append((cx[idx], cy[idx], w[idx], clouds))
 
-    # pixel grid extent
+    # pixel-grid extent
     if detector_mm is not None:
         dw, dh = detector_mm
         x_min, x_max, y_min, y_max = -dw / 2, dw / 2, -dh / 2, dh / 2
     else:
-        allx = np.concatenate([c[0] for c in curves if c is not None])
-        ally = np.concatenate([c[1] for c in curves if c is not None])
-        allw = np.concatenate([c[2] for c in curves if c is not None])
-        m = 5.0 * np.max(allw) + 2.0 * pitch_mm
+        allx = np.concatenate([L[0] for L in lines if L is not None])
+        ally = np.concatenate([L[1] for L in lines if L is not None])
+        if method == "rays":
+            dev = max(float(np.abs(c).max()) for L in lines
+                      if L is not None for c in L[3])
+        else:
+            dev = 5.0 * max(float(L[2].max()) for L in lines
+                            if L is not None)
+        m = dev + 2.0 * pitch_mm
         x_min, x_max = allx.min() - m, allx.max() + m
         y_min, y_max = ally.min() - m, ally.max() + m
     n_px = int(np.ceil((x_max - x_min) / pitch_mm))
@@ -695,28 +735,65 @@ def render_detector_image(res: SpotScanResult, pixel_pitch: u.Quantity,
     x_edges = x_min + np.arange(n_px + 1) * pitch_mm
     y_edges = y_min + np.arange(n_py + 1) * pitch_mm
     image = np.zeros((n_py, n_px))
-    logger.info("render: %d x %d pixels at %g um pitch",
-                n_px, n_py, pixel_pitch.to(u.um).value)
+    logger.info("render: %d x %d pixels at %g um pitch, method=%s",
+                n_px, n_py, pixel_pitch.to(u.um).value, method)
 
-    # deposit: separable Gaussian integrated over pixel boundaries
-    for k, curve in enumerate(curves):
-        if curve is None:
+    for L in lines:
+        if L is None:
             continue
-        cx, cy, w = curve
-        flux = 1.0 / cx.size                    # unit total flux per line
-        for j in range(cx.size):
-            sigma = max(w[j] / np.sqrt(2.0), 1e-9)
-            half = 4.0 * sigma
-            i0 = max(0, np.searchsorted(x_edges, cx[j] - half) - 1)
-            i1 = min(n_px, np.searchsorted(x_edges, cx[j] + half) + 1)
-            j0 = max(0, np.searchsorted(y_edges, cy[j] - half) - 1)
-            j1 = min(n_py, np.searchsorted(y_edges, cy[j] + half) + 1)
-            if i0 >= i1 or j0 >= j1:
-                continue
-            s = sigma * np.sqrt(2.0)
-            fx = 0.5 * np.diff(erf((x_edges[i0:i1 + 1] - cx[j]) / s))
-            fy = 0.5 * np.diff(erf((y_edges[j0:j1 + 1] - cy[j]) / s))
-            image[j0:j1, i0:i1] += flux * np.outer(fy, fx)
+        cx, cy, w, clouds = L
+        # fine samples along the line (arc length, ~pitch/2 steps)
+        if cx.size > 1:
+            ds = np.hypot(np.diff(cx), np.diff(cy))
+            t = np.concatenate(([0.0], np.cumsum(ds)))
+            n_fine = max(cx.size,
+                         int(np.ceil(t[-1] / (pitch_mm / 2.0))) + 1)
+            tf = np.linspace(0.0, t[-1], n_fine)
+            cxf = np.interp(tf, t, cx)
+            cyf = np.interp(tf, t, cy)
+            wf = np.interp(tf, t, w)
+            seg = np.clip(np.searchsorted(t, tf, side="right") - 1,
+                          0, cx.size - 2)
+            frac = np.where(np.diff(t)[seg] > 0,
+                            (tf - t[seg]) / np.diff(t)[seg], 0.0)
+        else:
+            cxf, cyf, wf = cx, cy, w
+            seg = np.zeros(1, dtype=int)
+            frac = np.zeros(1)
+        flux = 1.0 / cxf.size
+
+        if method == "gaussian":
+            from scipy.special import erf
+
+            for j in range(cxf.size):
+                sigma = max(wf[j] / np.sqrt(2.0), 1e-9)
+                half = 4.0 * sigma
+                i0 = max(0, np.searchsorted(x_edges, cxf[j] - half) - 1)
+                i1 = min(n_px, np.searchsorted(x_edges, cxf[j] + half) + 1)
+                j0 = max(0, np.searchsorted(y_edges, cyf[j] - half) - 1)
+                j1 = min(n_py, np.searchsorted(y_edges, cyf[j] + half) + 1)
+                if i0 >= i1 or j0 >= j1:
+                    continue
+                sq = sigma * np.sqrt(2.0)
+                fx = 0.5 * np.diff(erf((x_edges[i0:i1 + 1] - cxf[j]) / sq))
+                fy = 0.5 * np.diff(erf((y_edges[j0:j1 + 1] - cyf[j]) / sq))
+                image[j0:j1, i0:i1] += flux * np.outer(fy, fx)
+        else:
+            def deposit(pts_x, pts_y, weight):
+                ip = np.floor((pts_x - x_min) / pitch_mm).astype(int)
+                jp = np.floor((pts_y - y_min) / pitch_mm).astype(int)
+                ok = (ip >= 0) & (ip < n_px) & (jp >= 0) & (jp < n_py)
+                np.add.at(image, (jp[ok], ip[ok]), weight)
+
+            for j in range(cxf.size):
+                a, f = int(seg[j]), float(frac[j])
+                for cloud, wgt in ((clouds[a], (1.0 - f)),
+                                   (clouds[min(a + 1, len(clouds) - 1)],
+                                    f)):
+                    if wgt <= 0.0 or cloud.shape[0] == 0:
+                        continue
+                    deposit(cloud[:, 0] + cxf[j], cloud[:, 1] + cyf[j],
+                            flux * wgt / cloud.shape[0])
 
     # plot
     import matplotlib.pyplot as plt
@@ -730,19 +807,18 @@ def render_detector_image(res: SpotScanResult, pixel_pitch: u.Quantity,
                    interpolation="nearest")
     fig.colorbar(im, ax=ax, label="flux per pixel [fraction of line]")
     if annotate:
-        for k, curve in enumerate(curves):
-            if curve is None:
+        for k, L in enumerate(lines):
+            if L is None:
                 continue
-            cx, cy, _ = curve
             ax.annotate(f"{res.wavelengths_um[k] * 1000.0:.1f} nm",
-                        xy=(np.mean(cx), np.mean(cy)),
+                        xy=(float(np.mean(L[0])), float(np.mean(L[1]))),
                         xytext=(6, 0), textcoords="offset points",
                         color="w", fontsize=8, ha="left", va="center",
                         rotation=90)
     ax.set_xlabel("image plane X [mm]")
     ax.set_ylabel("image plane Y [mm]")
     ax.set_title(f"Simulated detector image "
-                 f"({pixel_pitch.to(u.um).value:g} um pixels)")
+                 f"({pixel_pitch.to(u.um).value:g} um pixels, {method})")
     fig.tight_layout()
     if savepath:
         fig.savefig(savepath, dpi=150)
@@ -933,6 +1009,29 @@ def self_test() -> None:
     fig, _ = plot_spectral_lines(lines, detector_mm=(14.19, 10.38))
     assert len(fig.axes[0].lines) >= 3, "one curve per spectral line"
 
+    # true-spot-shape rendering: the mock spot is a uniformly scaled
+    # hexapolar disk (NOT a Gaussian); a single-point "line" rendered at
+    # fine pitch must reproduce the ray cloud's second moment, and the
+    # rays must be recoverable via rays_at.
+    one = scan_spectral_lines(
+        _build_mock_zos(), wavelengths=(550 * u.nm,),
+        slit_range=(0.2 * u.deg, 0.2 * u.deg), n_slit=1, pupil_rings=6,
+    )
+    cloud = one.rays_at(0, 0, 0)
+    assert cloud.shape == (127, 2), "rays_at"
+    img1, (x0, x1, y0, y1), _, _ = render_detector_image(
+        one, pixel_pitch=2 * u.um, annotate=False)
+    assert abs(img1.sum() - 1.0) < 1e-12, "ray flux conservation"
+    pitch_mm = 2e-3
+    xc = x0 + (np.arange(img1.shape[1]) + 0.5) * pitch_mm
+    col = img1.sum(axis=0)
+    mu = np.sum(xc * col) / col.sum()
+    var_img = np.sum((xc - mu) ** 2 * col) / col.sum()
+    var_rays = np.var(cloud[:, 0] / 1000.0)
+    # image variance = ray variance + pixel binning variance (pitch^2/12)
+    assert abs(var_img - (var_rays + pitch_mm ** 2 / 12.0)) \
+        < 0.02 * var_rays, "spot shape second moment"
+
     # detector-image rendering: flux conservation + line positions
     img, (x0, x1, y0, y1), _, _ = render_detector_image(
         lines, pixel_pitch=25 * u.um, annotate=False)
@@ -1065,6 +1164,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                      else tuple(w * u.nm for w in args.waves)),
         pupil_rings=args.rings,
         normalization=args.normalization,
+        keep_rays=bool(args.image),   # true spot shapes for --image
     )
     # try:
     #     from .zemax_iface import ZOSConnection   # inside the package

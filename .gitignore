@@ -4,3 +4,6 @@ dist
 build
 *.egg
 *.pyc
+*.png
+*.PNG
+.vscode
