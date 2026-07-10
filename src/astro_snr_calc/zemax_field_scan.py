@@ -143,10 +143,66 @@ class SpotScanResult:
     rms_um: np.ndarray                # (n_wave, n_y, n_x) RMS spot radius
     rms_poly_um: np.ndarray           # (n_y, n_x) polychromatic
     n_valid: np.ndarray               # (n_wave, n_y, n_x) rays used
-    # Optional per-ray landing coordinates (keep_rays=True): a list of
-    # length n_y*n_x (row-major); each entry is an (n, 3) array of
-    # (wave_position, x_um, y_um).
-    rays: Optional[list] = None
+    # Optional per-ray data (keep_rays=True): a single (N, 5) float
+    # ndarray, one row per traced ray, columns RAY_COLUMNS =
+    # (wave_pos, field_x, field_y, x_um, y_um) — i.e. BOTH the casting
+    # field coordinates (in field_unit: deg or mm) and the image-plane
+    # landing position (um, image-surface local frame).
+    rays: Optional[np.ndarray] = None
+
+    RAY_COLUMNS = ("wave_pos", "field_x", "field_y", "x_um", "y_um")
+
+    # ---- composition ----------------------------------------------------
+    def __add__(self, other):
+        """`a + b` concatenates scans in memory (see concat_scans)."""
+        if not isinstance(other, SpotScanResult):
+            return NotImplemented
+        return concat_scans([self, other])
+
+    def __radd__(self, other):
+        """Supports sum(results): 0 + result -> result."""
+        if other == 0:
+            return self
+        return NotImplemented
+
+    # ---- persistence ------------------------------------------------------
+    def save(self, path) -> None:
+        """Save to a compressed .npz (plain arrays only, no pickling).
+
+        Round-trips through SpotScanResult.load(); loaded results can be
+        concatenated in memory with `+` / concat_scans like fresh scans.
+        """
+        payload = dict(
+            x_field=self.x_field, y_field=self.y_field,
+            unit_name=np.asarray(self.unit_name),
+            wave_indices=np.asarray(self.wave_indices, dtype=int),
+            wavelengths_um=np.asarray(self.wavelengths_um, dtype=float),
+            centroid_x_um=self.centroid_x_um,
+            centroid_y_um=self.centroid_y_um,
+            rms_um=self.rms_um, rms_poly_um=self.rms_poly_um,
+            n_valid=self.n_valid,
+        )
+        if self.rays is not None:
+            payload["rays"] = self.rays
+        np.savez_compressed(path, **payload)
+
+    @classmethod
+    def load(cls, path) -> "SpotScanResult":
+        """Load a result saved with save()."""
+        with np.load(path, allow_pickle=False) as z:
+            unit_name = str(z["unit_name"])
+            unit = {"deg": u.deg, "mm": u.mm}[unit_name]
+            return cls(
+                x_field=z["x_field"], y_field=z["y_field"],
+                field_unit=unit, unit_name=unit_name,
+                wave_indices=[int(w) for w in z["wave_indices"]],
+                wavelengths_um=[float(w) for w in z["wavelengths_um"]],
+                centroid_x_um=z["centroid_x_um"],
+                centroid_y_um=z["centroid_y_um"],
+                rms_um=z["rms_um"], rms_poly_um=z["rms_poly_um"],
+                n_valid=z["n_valid"],
+                rays=z["rays"] if "rays" in z.files else None,
+            )
 
     def to_image(self, pixel_pitch: u.Quantity,
                  detector_mm: Optional[tuple[float, float]] = None,
@@ -177,12 +233,19 @@ class SpotScanResult:
                             attrs=attrs, name="flux")
 
     def rays_at(self, wave_pos: int, iy: int, ix: int) -> np.ndarray:
-        """(n, 2) ray landing coordinates [um] for one grid point/line."""
+        """(n, 2) ray landing coordinates [um] for one grid point/line.
+
+        Selection is by the stored casting-field coordinates (not array
+        indices), so it remains valid after concat_scans() reorders or
+        merges grids.
+        """
         if self.rays is None:
             raise ValueError("scan was run without keep_rays=True")
-        arr = self.rays[iy * self.x_field.size + ix]
-        sel = arr[arr[:, 0] == wave_pos]
-        return sel[:, 1:3]
+        r = self.rays
+        sel = ((r[:, 0] == wave_pos)
+               & np.isclose(r[:, 1], self.x_field[ix])
+               & np.isclose(r[:, 2], self.y_field[iy]))
+        return r[sel][:, 3:5]
 
     # ---- interpolation ---------------------------------------------------
     def _wave_pos(self, wavelength: u.Quantity, tol_um: float = 1e-3) -> int:
@@ -378,6 +441,117 @@ def _make_ray_reader(norm_unpol):
 # ======================================================================
 # The scan
 # ======================================================================
+def concat_scans(results: list) -> SpotScanResult:
+    """Combine multiple SpotScanResults into one.
+
+    Two merge modes, chosen automatically:
+      * FIELD merge — identical wavelengths and one identical field axis:
+        results are concatenated along the other (slit) axis and sorted.
+        Use case: densifying slit regions with separate scans (e.g. after
+        an undersampling warning) without redoing the whole slit.
+      * WAVELENGTH merge — identical field grids: results are stacked
+        along the wavelength axis.  Use case: scanning lines in batches.
+
+    Per-ray data merges too: rays carry absolute field coordinates, so
+    no re-indexing of positions is needed (wavelength merge offsets the
+    wave_pos column).  Duplicate field samples / repeated grids raise.
+    """
+    if len(results) < 2:
+        return results[0]
+    r0 = results[0]
+    if any(r.unit_name != r0.unit_name for r in results):
+        raise ValueError("cannot merge scans with different field units")
+    same_lam = all(np.array_equal(r.wavelengths_um, r0.wavelengths_um)
+                   for r in results)
+    same_x = all(np.array_equal(r.x_field, r0.x_field) for r in results)
+    same_y = all(np.array_equal(r.y_field, r0.y_field) for r in results)
+
+    def cat_rays(offsets=None):
+        parts = []
+        for i, r in enumerate(results):
+            if r.rays is None:
+                return None
+            rr = r.rays
+            if offsets is not None and offsets[i]:
+                rr = rr.copy()
+                rr[:, 0] += offsets[i]
+            parts.append(rr)
+        return np.concatenate(parts)
+
+    if same_lam and (same_x or same_y):
+        # ---- field merge along the non-identical axis ----
+        axis = "y" if same_x else "x"
+        coords = np.concatenate([getattr(r, f"{axis}_field")
+                                 for r in results])
+        if np.unique(coords).size != coords.size:
+            raise ValueError(f"duplicate {axis} field samples across "
+                             f"scans; cannot merge")
+        order = np.argsort(coords)
+        np_axis = 1 if axis == "y" else 2
+        def cat(name):
+            a = np.concatenate([getattr(r, name) for r in results],
+                               axis=np_axis)
+            return np.take(a, order, axis=np_axis)
+        rms_poly = np.take(
+            np.concatenate([r.rms_poly_um for r in results],
+                           axis=np_axis - 1),
+            order, axis=np_axis - 1)
+        kw = dict(x_field=r0.x_field, y_field=coords[order]) \
+            if axis == "y" else \
+            dict(x_field=coords[order], y_field=r0.y_field)
+        return SpotScanResult(
+            field_unit=r0.field_unit, unit_name=r0.unit_name,
+            wave_indices=r0.wave_indices,
+            wavelengths_um=r0.wavelengths_um,
+            centroid_x_um=cat("centroid_x_um"),
+            centroid_y_um=cat("centroid_y_um"),
+            rms_um=cat("rms_um"), rms_poly_um=rms_poly,
+            n_valid=cat("n_valid"), rays=cat_rays(), **kw)
+
+    if same_x and same_y:
+        # ---- wavelength merge on the identical grid ----
+        lams, seen = [], set()
+        for r in results:
+            for lam in r.wavelengths_um:
+                if lam in seen:
+                    raise ValueError(f"wavelength {lam} um appears in "
+                                     f"multiple scans")
+                seen.add(lam)
+                lams.append(lam)
+        offsets = np.cumsum([0] + [len(r.wavelengths_um)
+                                   for r in results[:-1]])
+        def cat0(name):
+            return np.concatenate([getattr(r, name) for r in results],
+                                  axis=0)
+        # polychromatic RMS is NOT reconstructible from per-wave stats;
+        # conservatively recompute from rays if available, else NaN
+        rays = cat_rays(offsets)
+        rms_poly = np.full_like(r0.rms_poly_um, np.nan)
+        if rays is not None:
+            for iy, yv in enumerate(r0.y_field):
+                for ix, xv in enumerate(r0.x_field):
+                    sel = (np.isclose(rays[:, 1], xv)
+                           & np.isclose(rays[:, 2], yv))
+                    if sel.any():
+                        xy = rays[sel][:, 3:5]
+                        rms_poly[iy, ix] = np.sqrt(
+                            np.mean(np.sum((xy - xy.mean(0)) ** 2, 1)))
+        return SpotScanResult(
+            x_field=r0.x_field, y_field=r0.y_field,
+            field_unit=r0.field_unit, unit_name=r0.unit_name,
+            wave_indices=[w for r in results for w in r.wave_indices],
+            wavelengths_um=lams,
+            centroid_x_um=cat0("centroid_x_um"),
+            centroid_y_um=cat0("centroid_y_um"),
+            rms_um=cat0("rms_um"), rms_poly_um=rms_poly,
+            n_valid=cat0("n_valid"), rays=rays)
+
+    raise ValueError(
+        "scans are not mergeable: need identical wavelengths plus one "
+        "shared field axis (field merge), or identical field grids "
+        "(wavelength merge)")
+
+
 def _resolve_wavelengths(zos, wavelengths,
                          tol_um: float = 1e-5
                          ) -> tuple[list[int], list[float], list[int]]:
@@ -556,9 +730,29 @@ def scan_image_plane(zos, config: FieldScanConfig) -> SpotScanResult:
         wave_indices=wave_indices, wavelengths_um=wavelengths_um,
         centroid_x_um=cx, centroid_y_um=cy,
         rms_um=rms, rms_poly_um=rms_poly, n_valid=n_valid,
-        rays=([np.asarray(pts).reshape(-1, 3) for pts in xy_store]
+        rays=(_rays_ndarray(xy_store, x_ax, y_ax)
               if config.keep_rays else None),
     )
+
+
+def _rays_ndarray(xy_store, x_ax: np.ndarray, y_ax: np.ndarray
+                  ) -> np.ndarray:
+    """Flatten per-grid-point ray lists into one (N, 5) array carrying
+    both the casting field coordinates and the landing positions."""
+    chunks = []
+    for flat, pts in enumerate(xy_store):
+        if not pts:
+            continue
+        a = np.asarray(pts, dtype=float).reshape(-1, 3)  # (iw, x, y)
+        iy, ix = divmod(flat, x_ax.size)
+        out = np.empty((a.shape[0], 5))
+        out[:, 0] = a[:, 0]
+        out[:, 1] = x_ax[ix]
+        out[:, 2] = y_ax[iy]
+        out[:, 3:5] = a[:, 1:3]
+        chunks.append(out)
+    return (np.concatenate(chunks) if chunks
+            else np.empty((0, 5)))
 
 
 # ======================================================================
@@ -1237,6 +1431,65 @@ def self_test() -> None:
     lit = xs[prof > prof.max() * 1e-3]
     assert (lit.max() - lit.min()) > 0.06, "slit width rendered"
 
+    # rays ndarray: field coords + landing positions per ray
+    r = nonuni.rays
+    assert isinstance(r, np.ndarray) and r.shape[1] == 5
+    assert set(np.round(np.unique(r[:, 2]), 6)) <= \
+        set(np.round(nonuni.y_field, 6)), "casting fields stored"
+    assert np.array_equal(nonuni.rays_at(0, 4, 0),
+                          r[(r[:, 0] == 0)
+                            & np.isclose(r[:, 2],
+                                         nonuni.y_field[4])][:, 3:5])
+
+    # concat: two half-slit scans == one full scan (field merge)
+    full_pts = tuple(v * u.deg for v in np.linspace(-0.5, 0.5, 9))
+    full = scan_spectral_lines(_build_mock_zos(),
+                               wavelengths=(550 * u.nm,),
+                               slit_points=full_pts, pupil_rings=3)
+    ha = scan_spectral_lines(_build_mock_zos(), wavelengths=(550 * u.nm,),
+                             slit_points=full_pts[:5], pupil_rings=3)
+    hb = scan_spectral_lines(_build_mock_zos(), wavelengths=(550 * u.nm,),
+                             slit_points=full_pts[5:], pupil_rings=3)
+    merged = concat_scans([hb, ha])         # out of order on purpose
+    assert np.allclose(merged.y_field, full.y_field)
+    assert np.allclose(merged.rms_um, full.rms_um)
+    assert np.allclose(merged.centroid_x_um, full.centroid_x_um)
+    assert merged.rays.shape[0] == full.rays.shape[0]
+    m_img = np.asarray(merged.to_image(pixel_pitch=25 * u.um).values)
+    f_img = np.asarray(full.to_image(pixel_pitch=25 * u.um).values)
+    assert np.allclose(m_img, f_img), "merged scan renders identically"
+
+    # concat: wavelength merge on the same grid
+    wa = scan_spectral_lines(_build_mock_zos(), wavelengths=(550 * u.nm,),
+                             slit_points=full_pts, pupil_rings=3)
+    wb = scan_spectral_lines(_build_mock_zos(), wavelengths=(486 * u.nm,),
+                             slit_points=full_pts, pupil_rings=3)
+    wl = concat_scans([wa, wb])
+    assert wl.rms_um.shape[0] == 2 and len(wl.wavelengths_um) == 2
+    sep = (np.nanmean(wl.centroid_x_um[1]) - np.nanmean(
+        wl.centroid_x_um[0]))
+    assert abs(sep - _MOCK_DISP_MM * 1000.0) < 1e-6, \
+        "wavelength-merged dispersion"
+    assert np.all(np.isfinite(wl.rms_poly_um)), "poly RMS from rays"
+
+    # persistence + in-memory composition: save both halves, load them,
+    # and concatenate with `+`; must equal the direct merge exactly
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as td:
+        pa, pb = os.path.join(td, "a.npz"), os.path.join(td, "b.npz")
+        ha.save(pa)
+        hb.save(pb)
+        la, lb = SpotScanResult.load(pa), SpotScanResult.load(pb)
+        assert np.allclose(la.rms_um, ha.rms_um)
+        assert np.array_equal(la.rays, ha.rays)
+        assert la.unit_name == ha.unit_name
+        summed = lb + la                       # operator form
+        assert np.allclose(summed.rms_um, merged.rms_um)
+        assert np.allclose(summed.centroid_x_um, merged.centroid_x_um)
+        assert np.array_equal(np.sort(summed.rays, axis=0),
+                              np.sort(merged.rays, axis=0))
+        assert np.allclose(sum([la, lb]).rms_um, merged.rms_um)  # sum()
+
     # detector offset: grid recenters, deposited flux pattern unchanged
     # (mock spot sits at y ~= f*tan(0.2 deg) ~= 0.418 mm off the vertex)
     da_off = one.to_image(pixel_pitch=2 * u.um, detector_mm=(0.5, 0.5),
@@ -1294,7 +1547,7 @@ def _print_report(res: SpotScanResult) -> None:
 def _plot_report(res: SpotScanResult, path: str) -> None:
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(8, 5.5))
+    fig, ax = plt.subplots(figsize=(6.4, 4.8), dpi=300)
     pcm = ax.pcolormesh(res.x_field, res.y_field, res.rms_poly_um,
                         shading="auto", cmap="viridis")
     fig.colorbar(pcm, ax=ax, label="polychromatic RMS spot radius [um]")
@@ -1305,7 +1558,7 @@ def _plot_report(res: SpotScanResult, path: str) -> None:
     ax.set_title("Image-plane spot scan")
     ax.legend(loc="best")
     fig.tight_layout()
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=300)
     print(f"plot saved to {path}")
 
 

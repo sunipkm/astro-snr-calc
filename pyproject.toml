@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
-SNRCalc = "astro_snr_calc.cli:main"
+SNRCalc = "astro_snr_calc.snr_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
