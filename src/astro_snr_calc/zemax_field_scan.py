@@ -88,11 +88,21 @@ class FieldScanConfig:
     # corner radius, which usually matches a rectangular detector scan.
     normalization: Optional[str] = None
 
+    # Optional explicit sample points (quantities), overriding
+    # range/count; may be NON-UNIFORM, e.g. to densify regions where the
+    # spot shape changes rapidly along a spectrograph slit.
+    x_points: Optional[tuple] = None
+    y_points: Optional[tuple] = None
+
     def x_axis(self, unit) -> np.ndarray:
+        if self.x_points is not None:
+            return np.sort([q.to(unit).value for q in self.x_points])
         lo, hi = (q.to(unit).value for q in self.x_range)
         return np.linspace(lo, hi, self.n_x)
 
     def y_axis(self, unit) -> np.ndarray:
+        if self.y_points is not None:
+            return np.sort([q.to(unit).value for q in self.y_points])
         lo, hi = (q.to(unit).value for q in self.y_range)
         return np.linspace(lo, hi, self.n_y)
 
@@ -141,7 +151,8 @@ class SpotScanResult:
     def to_image(self, pixel_pitch: u.Quantity,
                  detector_mm: Optional[tuple[float, float]] = None,
                  method: str = "auto",
-                 detector_center_mm: tuple[float, float] = (0.0, 0.0)):
+                 detector_center_mm: tuple[float, float] = (0.0, 0.0),
+                 oversample: int = 4):
         """Render the spectral lines onto a pixel grid -> xarray.DataArray.
 
         Pure computation, no plotting: dims ("y", "x") with pixel-center
@@ -159,7 +170,8 @@ class SpotScanResult:
 
         image, x_c, y_c, attrs = _render_image(self, pixel_pitch,
                                                detector_mm, method,
-                                               detector_center_mm)
+                                               detector_center_mm,
+                                               oversample)
         return xr.DataArray(image, dims=("y", "x"),
                             coords={"x": x_c, "y": y_c},
                             attrs=attrs, name="flux")
@@ -552,7 +564,9 @@ def scan_image_plane(zos, config: FieldScanConfig) -> SpotScanResult:
 # ======================================================================
 # Spectrograph: spectral lines on the image plane
 # ======================================================================
-def scan_spectral_lines(zos, wavelengths, slit_range, n_slit: int = 41,
+def scan_spectral_lines(zos, wavelengths, slit_range=None,
+                        n_slit: int = 41,
+                        slit_points=None,
                         slit_axis: str = "y",
                         cross_field: Optional[u.Quantity] = None,
                         pupil_rings: int = 4,
@@ -572,18 +586,22 @@ def scan_spectral_lines(zos, wavelengths, slit_range, n_slit: int = 41,
     (centroid_x_um, centroid_y_um)[k] along the slit, with per-point width
     rms_um[k]; plot with `plot_spectral_lines`.
     """
-    zero = 0 * (slit_range[0].unit if hasattr(slit_range[0], "unit")
-                else u.deg)
+    if slit_range is None and slit_points is None:
+        raise ValueError("provide slit_range or slit_points")
+    ref = slit_points[0] if slit_points is not None else slit_range[0]
+    zero = 0 * (ref.unit if hasattr(ref, "unit") else u.deg)
     cross = cross_field if cross_field is not None else zero
+    rng = slit_range if slit_range is not None else (ref, ref)
+    pts = tuple(slit_points) if slit_points is not None else None
     if slit_axis == "y":
         cfg = FieldScanConfig(x_range=(cross, cross), n_x=1,
-                              y_range=slit_range, n_y=n_slit,
+                              y_range=rng, n_y=n_slit, y_points=pts,
                               wavelengths=tuple(wavelengths),
                               pupil_rings=pupil_rings,
                               normalization=normalization,
                               keep_rays=keep_rays)
     elif slit_axis == "x":
-        cfg = FieldScanConfig(x_range=slit_range, n_x=n_slit,
+        cfg = FieldScanConfig(x_range=rng, n_x=n_slit, x_points=pts,
                               y_range=(cross, cross), n_y=1,
                               wavelengths=tuple(wavelengths),
                               pupil_rings=pupil_rings,
@@ -683,7 +701,8 @@ def plot_spectral_lines(res: SpotScanResult, savepath: Optional[str] = None,
 def _render_image(res: SpotScanResult, pixel_pitch: u.Quantity,
                   detector_mm: Optional[tuple[float, float]] = None,
                   method: str = "auto",
-                  detector_center_mm: tuple[float, float] = (0.0, 0.0)):
+                  detector_center_mm: tuple[float, float] = (0.0, 0.0),
+                  oversample: int = 4):
     """Compute the detector image (no plotting).
 
     Coordinate convention: all positions are in the Zemax image surface's
@@ -706,6 +725,12 @@ def _render_image(res: SpotScanResult, pixel_pitch: u.Quantity,
       "gaussian" analytic approximation: sigma = RMS/sqrt(2), integrated
                  over pixel boundaries (per-axis erf).
       "auto"     "rays" when ray data is present, else "gaussian".
+
+    oversample (rays method only): rays are deposited on a grid
+    `oversample` times finer, then block-summed to the native pitch.
+    This integrates flux over the pixel AREA and removes pixel-phase
+    aliasing when the line width is below the pixel pitch (banding along
+    a sharp line).  Flux is exactly conserved.  1 disables.
     """
     if method == "auto":
         method = "rays" if res.rays is not None else "gaussian"
@@ -718,26 +743,44 @@ def _render_image(res: SpotScanResult, pixel_pitch: u.Quantity,
     n_lines = len(res.wavelengths_um)
     n_x = res.x_field.size
 
-    # per-line data along the slit: centroids [mm], widths [mm], and (for
-    # method="rays") the ray clouds relative to their centroid [mm]
+    # per-line data: one sub-curve per column ACROSS the slit (the slit
+    # runs along the larger scan axis).  A 2-D scan — e.g. several field
+    # columns sampling a finite slit WIDTH — is rendered as parallel
+    # sub-curves sharing the line's unit flux, not as one raveled
+    # zigzag path.
+    n_y = res.y_field.size
+    slit_along_y = n_y >= n_x
+    n_cols = n_x if slit_along_y else n_y
+    if n_cols > 1:
+        logger.info("render: %d columns across the slit per line",
+                    n_cols)
     lines = []
     for k in range(n_lines):
-        cx = res.centroid_x_um[k].ravel() / 1000.0
-        cy = res.centroid_y_um[k].ravel() / 1000.0
-        w = res.rms_um[k].ravel() / 1000.0
-        good = np.isfinite(cx) & np.isfinite(cy) & np.isfinite(w)
-        idx = np.nonzero(good)[0]
-        if idx.size == 0:
-            lines.append(None)
-            continue
-        clouds = None
-        if method == "rays":
-            clouds = []
-            for flat in idx:
-                iy, ix = divmod(int(flat), n_x)
-                r = res.rays_at(k, iy, ix) / 1000.0          # mm
-                clouds.append(r - [cx[flat], cy[flat]])      # centered
-        lines.append((cx[idx], cy[idx], w[idx], clouds))
+        CX = res.centroid_x_um[k] / 1000.0        # (n_y, n_x) [mm]
+        CY = res.centroid_y_um[k] / 1000.0
+        W = res.rms_um[k] / 1000.0
+        curves = []
+        for c in range(n_cols):
+            if slit_along_y:
+                cx, cy, w = CX[:, c], CY[:, c], W[:, c]
+                flats = np.arange(n_y) * n_x + c
+            else:
+                cx, cy, w = CX[c, :], CY[c, :], W[c, :]
+                flats = c * n_x + np.arange(n_x)
+            good = np.isfinite(cx) & np.isfinite(cy) & np.isfinite(w)
+            if not good.any():
+                continue
+            cx, cy, w = cx[good], cy[good], w[good]
+            clouds = None
+            if method == "rays":
+                clouds = []
+                for flat in flats[good]:
+                    iy, ix = divmod(int(flat), n_x)
+                    r = res.rays_at(k, iy, ix) / 1000.0      # mm
+                    clouds.append(r - [cx[len(clouds)],
+                                       cy[len(clouds)]])     # centered
+            curves.append((cx, cy, w, clouds))
+        lines.append(curves if curves else None)
 
     # pixel-grid extent
     if detector_mm is not None:
@@ -746,14 +789,14 @@ def _render_image(res: SpotScanResult, pixel_pitch: u.Quantity,
         x_min, x_max = cx0 - dw / 2, cx0 + dw / 2
         y_min, y_max = cy0 - dh / 2, cy0 + dh / 2
     else:
-        allx = np.concatenate([L[0] for L in lines if L is not None])
-        ally = np.concatenate([L[1] for L in lines if L is not None])
+        curves_all = [C for L in lines if L is not None for C in L]
+        allx = np.concatenate([C[0] for C in curves_all])
+        ally = np.concatenate([C[1] for C in curves_all])
         if method == "rays":
-            dev = max(float(np.abs(c).max()) for L in lines
-                      if L is not None for c in L[3])
+            dev = max(float(np.abs(cl).max()) for C in curves_all
+                      for cl in C[3])
         else:
-            dev = 5.0 * max(float(L[2].max()) for L in lines
-                            if L is not None)
+            dev = 5.0 * max(float(C[2].max()) for C in curves_all)
         m = dev + 2.0 * pitch_mm
         x_min, x_max = allx.min() - m, allx.max() + m
         y_min, y_max = ally.min() - m, ally.max() + m
@@ -761,66 +804,79 @@ def _render_image(res: SpotScanResult, pixel_pitch: u.Quantity,
     n_py = int(np.ceil((y_max - y_min) / pitch_mm))
     x_edges = x_min + np.arange(n_px + 1) * pitch_mm
     y_edges = y_min + np.arange(n_py + 1) * pitch_mm
-    image = np.zeros((n_py, n_px))
-    logger.info("render: %d x %d pixels at %g um pitch, method=%s",
-                n_px, n_py, pixel_pitch.to(u.um).value, method)
+    ov = max(1, int(oversample)) if method == "rays" else 1
+    pitch_f = pitch_mm / ov               # deposition grid (rays)
+    n_pxf, n_pyf = n_px * ov, n_py * ov
+    image = np.zeros((n_pyf, n_pxf))
+    logger.info("render: %d x %d pixels at %g um pitch, method=%s, "
+                "oversample=%d", n_px, n_py,
+                pixel_pitch.to(u.um).value, method, ov)
 
-    for L in lines:
+    for k, L in enumerate(lines):
         if L is None:
             continue
-        cx, cy, w, clouds = L
-        # fine samples along the line (arc length, ~pitch/2 steps)
-        if cx.size > 1:
-            ds = np.hypot(np.diff(cx), np.diff(cy))
-            t = np.concatenate(([0.0], np.cumsum(ds)))
-            n_fine = max(cx.size,
-                         int(np.ceil(t[-1] / (pitch_mm / 2.0))) + 1)
-            tf = np.linspace(0.0, t[-1], n_fine)
-            cxf = np.interp(tf, t, cx)
-            cyf = np.interp(tf, t, cy)
-            wf = np.interp(tf, t, w)
-            seg = np.clip(np.searchsorted(t, tf, side="right") - 1,
-                          0, cx.size - 2)
-            frac = np.where(np.diff(t)[seg] > 0,
-                            (tf - t[seg]) / np.diff(t)[seg], 0.0)
-        else:
-            cxf, cyf, wf = cx, cy, w
-            seg = np.zeros(1, dtype=int)
-            frac = np.zeros(1)
-        flux = 1.0 / cxf.size
+        # diagnostics on the central column only (columns are near-copies)
+        mid = L[len(L) // 2]
+        if method == "rays" and mid[0].size > 1:
+            _warn_undersampled_shape(res, k, mid[0], mid[1], mid[2])
+        # each sub-curve carries an equal share of the line's unit flux
+        for cx, cy, w, clouds in L:
+            # fine samples along the line (arc length, ~pitch/2 steps)
+            if cx.size > 1:
+                ds = np.hypot(np.diff(cx), np.diff(cy))
+                t = np.concatenate(([0.0], np.cumsum(ds)))
+                n_fine = max(cx.size,
+                             int(np.ceil(t[-1] / (pitch_f / 2.0))) + 1)
+                tf = np.linspace(0.0, t[-1], n_fine)
+                cxf = np.interp(tf, t, cx)
+                cyf = np.interp(tf, t, cy)
+                wf = np.interp(tf, t, w)
+                seg = np.clip(np.searchsorted(t, tf, side="right") - 1,
+                              0, cx.size - 2)
+                frac = np.where(np.diff(t)[seg] > 0,
+                                (tf - t[seg]) / np.diff(t)[seg], 0.0)
+            else:
+                cxf, cyf, wf = cx, cy, w
+                seg = np.zeros(1, dtype=int)
+                frac = np.zeros(1)
+            flux = 1.0 / (cxf.size * len(L))
 
-        if method == "gaussian":
-            from scipy.special import erf
+            if method == "gaussian":
+                from scipy.special import erf
 
-            for j in range(cxf.size):
-                sigma = max(wf[j] / np.sqrt(2.0), 1e-9)
-                half = 4.0 * sigma
-                i0 = max(0, np.searchsorted(x_edges, cxf[j] - half) - 1)
-                i1 = min(n_px, np.searchsorted(x_edges, cxf[j] + half) + 1)
-                j0 = max(0, np.searchsorted(y_edges, cyf[j] - half) - 1)
-                j1 = min(n_py, np.searchsorted(y_edges, cyf[j] + half) + 1)
-                if i0 >= i1 or j0 >= j1:
-                    continue
-                sq = sigma * np.sqrt(2.0)
-                fx = 0.5 * np.diff(erf((x_edges[i0:i1 + 1] - cxf[j]) / sq))
-                fy = 0.5 * np.diff(erf((y_edges[j0:j1 + 1] - cyf[j]) / sq))
-                image[j0:j1, i0:i1] += flux * np.outer(fy, fx)
-        else:
-            def deposit(pts_x, pts_y, weight):
-                ip = np.floor((pts_x - x_min) / pitch_mm).astype(int)
-                jp = np.floor((pts_y - y_min) / pitch_mm).astype(int)
-                ok = (ip >= 0) & (ip < n_px) & (jp >= 0) & (jp < n_py)
-                np.add.at(image, (jp[ok], ip[ok]), weight)
-
-            for j in range(cxf.size):
-                a, f = int(seg[j]), float(frac[j])
-                for cloud, wgt in ((clouds[a], (1.0 - f)),
-                                   (clouds[min(a + 1, len(clouds) - 1)],
-                                    f)):
-                    if wgt <= 0.0 or cloud.shape[0] == 0:
+                for j in range(cxf.size):
+                    sigma = max(wf[j] / np.sqrt(2.0), 1e-9)
+                    half = 4.0 * sigma
+                    i0 = max(0, np.searchsorted(x_edges, cxf[j] - half) - 1)
+                    i1 = min(n_px, np.searchsorted(x_edges, cxf[j] + half) + 1)
+                    j0 = max(0, np.searchsorted(y_edges, cyf[j] - half) - 1)
+                    j1 = min(n_py, np.searchsorted(y_edges, cyf[j] + half) + 1)
+                    if i0 >= i1 or j0 >= j1:
                         continue
-                    deposit(cloud[:, 0] + cxf[j], cloud[:, 1] + cyf[j],
-                            flux * wgt / cloud.shape[0])
+                    sq = sigma * np.sqrt(2.0)
+                    fx = 0.5 * np.diff(erf((x_edges[i0:i1 + 1] - cxf[j]) / sq))
+                    fy = 0.5 * np.diff(erf((y_edges[j0:j1 + 1] - cyf[j]) / sq))
+                    image[j0:j1, i0:i1] += flux * np.outer(fy, fx)
+            else:
+                def deposit(pts_x, pts_y, weight):
+                    ip = np.floor((pts_x - x_min) / pitch_f).astype(int)
+                    jp = np.floor((pts_y - y_min) / pitch_f).astype(int)
+                    ok = (ip >= 0) & (ip < n_pxf) & (jp >= 0) & (jp < n_pyf)
+                    np.add.at(image, (jp[ok], ip[ok]), weight)
+
+                for j in range(cxf.size):
+                    a, f = int(seg[j]), float(frac[j])
+                    for cloud, wgt in ((clouds[a], (1.0 - f)),
+                                       (clouds[min(a + 1, len(clouds) - 1)],
+                                        f)):
+                        if wgt <= 0.0 or cloud.shape[0] == 0:
+                            continue
+                        deposit(cloud[:, 0] + cxf[j], cloud[:, 1] + cyf[j],
+                                flux * wgt / cloud.shape[0])
+
+
+    if ov > 1:
+        image = image.reshape(n_py, ov, n_px, ov).sum(axis=(1, 3))
 
     x_centers = x_min + (np.arange(n_px) + 0.5) * pitch_mm
     y_centers = y_min + (np.arange(n_py) + 0.5) * pitch_mm
@@ -829,14 +885,50 @@ def _render_image(res: SpotScanResult, pixel_pitch: u.Quantity,
         "pixel_pitch_um": float(pixel_pitch.to(u.um).value),
         "method": method,
         "wavelengths_nm": [lam * 1000.0 for lam in res.wavelengths_um],
-        "line_x_mm": [float(np.mean(L[0])) if L is not None else np.nan
-                      for L in lines],
-        "line_y_mm": [float(np.mean(L[1])) if L is not None else np.nan
-                      for L in lines],
+        "line_x_mm": [float(np.mean(np.concatenate([C[0] for C in L])))
+                      if L is not None else np.nan for L in lines],
+        "line_y_mm": [float(np.mean(np.concatenate([C[1] for C in L])))
+                      if L is not None else np.nan for L in lines],
         "detector_center_mm": list(detector_center_mm),
         "origin": "Zemax image-surface vertex (local frame)",
     }
     return image, x_centers, y_centers, attrs
+
+
+def _warn_undersampled_shape(res: SpotScanResult, k: int,
+                             cx: np.ndarray, cy: np.ndarray,
+                             w: np.ndarray,
+                             rms_jump_tol: float = 0.3,
+                             bend_tol: float = 0.5) -> None:
+    """Warn where the slit sampling is too coarse for shape morphing.
+
+    Cross-fading neighboring ray clouds assumes the spot evolves roughly
+    linearly between slit samples.  Two symptoms of violation:
+      * fractional RMS jump between adjacent samples exceeding
+        `rms_jump_tol` (aberration content changing fast);
+      * centroid bending: second difference exceeding `bend_tol` x the
+        local RMS (the line curves significantly between samples).
+    Both produce ghost/doubling artifacts in the render; the fix is more
+    real ray data there — pass denser `slit_points` around the reported
+    field positions.
+    """
+    slit = res.y_field if res.y_field.size > 1 else res.x_field
+    flags = np.zeros(cx.size, dtype=bool)
+    jump = np.abs(np.diff(w)) / np.maximum(w[:-1], 1e-12)
+    flags[:-1] |= jump > rms_jump_tol
+    if cx.size > 2:
+        bend = np.hypot(np.diff(cx, 2), np.diff(cy, 2))
+        flags[1:-1] |= bend > bend_tol * np.maximum(w[1:-1], 1e-12)
+    if flags.any() and slit.size == cx.size:
+        logger.warning(
+            "render: line %d (%.4g um): spot shape/position changes "
+            "faster than the slit sampling near field = %s %s; expect "
+            "morphing artifacts there — add denser slit_points in "
+            "those regions",
+            k + 1, res.wavelengths_um[k],
+            np.array2string(slit[flags], precision=3, threshold=8),
+            res.unit_name,
+        )
 
 
 def plot_detector_image(da, annotate: bool = True,
@@ -1094,6 +1186,57 @@ def self_test() -> None:
     assert abs(var_img - (var_rays + pitch_mm ** 2 / 12.0)) \
         < 0.02 * var_rays, "spot shape second moment"
 
+    # oversampled deposition: identical flux, same second moment
+    da_ov = one.to_image(pixel_pitch=2 * u.um, oversample=8)
+    img_ov = np.asarray(da_ov.values)
+    assert abs(img_ov.sum() - 1.0) < 1e-12, "oversampled flux"
+    assert img_ov.shape == img1.shape, "oversampling keeps native grid"
+
+    # non-uniform slit sampling (densified center)
+    pts = tuple(v * u.deg for v in
+                (-0.5, -0.3, -0.1, -0.05, 0.0, 0.05, 0.1, 0.3, 0.5))
+    nonuni = scan_spectral_lines(
+        _build_mock_zos(), wavelengths=(550 * u.nm,),
+        slit_points=pts, pupil_rings=3)
+    assert nonuni.y_field.size == 9
+    assert not np.allclose(np.diff(nonuni.y_field),
+                           np.diff(nonuni.y_field)[0]), "non-uniform axis"
+    assert np.all(np.isfinite(nonuni.rms_um)), "non-uniform scan traces"
+
+    # undersampling diagnostic: coarse slit over strong blur gradient
+    records = []
+    h = logging.Handler()
+    h.emit = lambda rec: records.append(rec.getMessage())
+    logger.addHandler(h)
+    try:
+        coarse = scan_spectral_lines(
+            _build_mock_zos(), wavelengths=(550 * u.nm,),
+            slit_range=(-1.9 * u.deg, 1.9 * u.deg), n_slit=3,
+            pupil_rings=3)
+        coarse.to_image(pixel_pitch=10 * u.um)
+    finally:
+        logger.removeHandler(h)
+    assert any("faster than the slit sampling" in m for m in records), \
+        "undersampling warning"
+
+    # finite slit width: a 2-D scan renders as parallel sub-curves with
+    # shared flux, not a raveled zigzag
+    wide = FieldScanConfig(
+        x_range=(-0.02 * u.deg, 0.02 * u.deg), n_x=3,
+        y_range=(-0.4 * u.deg, 0.4 * u.deg), n_y=9,
+        wavelengths=(550 * u.nm,), pupil_rings=3, keep_rays=True,
+        normalization="radial")
+    wres = scan_image_plane(_build_mock_zos(), wide)
+    da_w = wres.to_image(pixel_pitch=10 * u.um)
+    img_w = np.asarray(da_w.values)
+    assert abs(img_w.sum() - 1.0) < 1e-12, "2-D scan flux conservation"
+    # x footprint must span the three columns (~2*f*tan(0.02deg) ~ 84 um),
+    # far wider than a single column's spot alone
+    xs = np.asarray(da_w["x"].values, dtype=float)
+    prof = img_w.sum(axis=0)
+    lit = xs[prof > prof.max() * 1e-3]
+    assert (lit.max() - lit.min()) > 0.06, "slit width rendered"
+
     # detector offset: grid recenters, deposited flux pattern unchanged
     # (mock spot sits at y ~= f*tan(0.2 deg) ~= 0.418 mm off the vertex)
     da_off = one.to_image(pixel_pitch=2 * u.um, detector_mm=(0.5, 0.5),
@@ -1205,6 +1348,9 @@ def main(argv: Optional[list[str]] = None) -> None:
                     metavar=("W_MM", "H_MM"),
                     help="detector outline for --lines / extent for "
                     "--image (IMX267: 14.19 10.38)")
+    ap.add_argument("--oversample", type=int, default=4, metavar="N",
+                    help="sub-pixel deposition factor for --image "
+                    "(anti-aliasing of sharp lines; default 4)")
     ap.add_argument("--pitch", type=float, default=None, metavar="UM",
                     help="detector pixel pitch in um (IMX267: 3.45); "
                     "required with --image")
@@ -1268,6 +1414,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         da = res.to_image(
             pixel_pitch=args.pitch * u.um,
             detector_mm=(tuple(args.detector) if args.detector else None),
+            oversample=args.oversample,
         )
         plot_detector_image(da, savepath=args.image)
 
