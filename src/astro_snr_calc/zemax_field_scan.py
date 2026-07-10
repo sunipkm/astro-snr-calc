@@ -554,7 +554,16 @@ class SpotScanResult:
             logger.info("render: %d columns across the slit per line",
                         n_cols)
         lines = []
-        pbar = tqdm(total=n_lines*n_cols, desc="Rendering lines", unit="line", dynamic_ncols=True)
+        total_lines = n_lines * n_cols
+        dtot_l = 1
+        if method == 'rays':
+            if slit_along_y:
+                total_lines *= n_y
+                dtot_l = n_y
+            else:
+                total_lines *= n_x
+                dtot_l = n_x
+        pbar = tqdm(total=total_lines, desc="Rendering lines", unit="line", dynamic_ncols=True)
         for k in range(n_lines):
             CX = self.centroid_x_um[k] / 1000.0        # (n_y, n_x) [mm]
             CY = self.centroid_y_um[k] / 1000.0
@@ -569,7 +578,7 @@ class SpotScanResult:
                     flats = c * n_x + np.arange(n_x)
                 good = np.isfinite(cx) & np.isfinite(cy) & np.isfinite(w)
                 if not good.any():
-                    pbar.update(1)
+                    pbar.update(dtot_l)
                     continue
                 cx, cy, w = cx[good], cy[good], w[good]
                 clouds = None
@@ -580,8 +589,11 @@ class SpotScanResult:
                         r = self.rays_at(k, iy, ix) / 1000.0      # mm
                         clouds.append(r - [cx[len(clouds)],
                                            cy[len(clouds)]])     # centered
+                        pbar.update(1)
+                    pbar.update(dtot_l - len(flats[good]))
+                else:
+                    pbar.update(dtot_l)
                 curves.append((cx, cy, w, clouds))
-                pbar.update(1)
             lines.append(curves if curves else None)
 
         # pixel-grid extent
