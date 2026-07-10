@@ -554,6 +554,7 @@ class SpotScanResult:
             logger.info("render: %d columns across the slit per line",
                         n_cols)
         lines = []
+        pbar = tqdm(total=n_lines*n_cols, desc="Rendering lines", unit="line", dynamic_ncols=True)
         for k in range(n_lines):
             CX = self.centroid_x_um[k] / 1000.0        # (n_y, n_x) [mm]
             CY = self.centroid_y_um[k] / 1000.0
@@ -568,6 +569,7 @@ class SpotScanResult:
                     flats = c * n_x + np.arange(n_x)
                 good = np.isfinite(cx) & np.isfinite(cy) & np.isfinite(w)
                 if not good.any():
+                    pbar.update(1)
                     continue
                 cx, cy, w = cx[good], cy[good], w[good]
                 clouds = None
@@ -579,6 +581,7 @@ class SpotScanResult:
                         clouds.append(r - [cx[len(clouds)],
                                            cy[len(clouds)]])     # centered
                 curves.append((cx, cy, w, clouds))
+                pbar.update(1)
             lines.append(curves if curves else None)
 
         # pixel-grid extent
@@ -613,7 +616,8 @@ class SpotScanResult:
                     "oversample=%d", n_px, n_py,
                     pixel_pitch.to(u.um).value, method, ov)
 
-        for k, L in enumerate(lines):
+        for k, L in tqdm(enumerate(lines), total=len(lines),
+                         desc="Rendering", unit="line"):
             if L is None:
                 continue
             # diagnostics on the central column only (columns are near-copies)
