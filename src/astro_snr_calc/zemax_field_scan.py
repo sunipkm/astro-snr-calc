@@ -285,56 +285,6 @@ def hexapolar_pupil(n_rings: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ======================================================================
-# Vectorised ray-deposition helper
-# ======================================================================
-def _deposit_rays_vectorized(
-    image: np.ndarray,
-    clouds: list,
-    cxf: np.ndarray, cyf: np.ndarray,
-    seg: np.ndarray, frac: np.ndarray,
-    flux: float,
-    x_min: float, y_min: float,
-    pitch_f: float, n_pxf: int, n_pyf: int,
-) -> None:
-    """Deposit ray clouds onto the pixel grid without a Python loop.
-
-    Replaces the per-sample ``for j in range(cxf.size)`` loop and the slow
-    ``np.add.at`` scatter-add with two vectorised operations:
-
-    1. A single broadcast+reshape builds ALL shifted ray positions at once
-       — (n_fine, n_rays, 2) → (n_fine*n_rays, 2) — eliminating the Python
-       loop entirely.
-    2. ``np.bincount`` (a single buffered C loop) replaces ``np.add.at``
-       (unbuffered scatter-add with per-element Python overhead).
-
-    Typical speedup: 100–1000× for a 14 mm detector at 3.45 µm pitch with
-    127 rays per slit sample and thousands of fine interpolation steps.
-    """
-    if not clouds or cxf.size == 0:
-        return
-    n_r = clouds[0].shape[0]
-    nc = len(clouds)
-    clouds_arr = np.stack(clouds)                        # (nc, n_r, 2)
-    sa = np.clip(seg, 0, nc - 2)                        # lower cloud idx
-    sb = np.minimum(sa + 1, nc - 1)                     # upper cloud idx
-    shift = np.stack([cxf, cyf], axis=1)[:, np.newaxis, :]  # (n_fine,1,2)
-    ca = (clouds_arr[sa] + shift).reshape(-1, 2)        # (n_fine*n_r, 2)
-    cb = (clouds_arr[sb] + shift).reshape(-1, 2)
-    wa = np.repeat((1.0 - frac) * (flux / n_r), n_r)
-    wb = np.repeat(frac * (flux / n_r), n_r)
-    for pts, wts in ((ca, wa), (cb, wb)):
-        ip = np.floor((pts[:, 0] - x_min) / pitch_f).astype(np.intp)
-        jp = np.floor((pts[:, 1] - y_min) / pitch_f).astype(np.intp)
-        ok = (ip >= 0) & (ip < n_pxf) & (jp >= 0) & (jp < n_pyf)
-        if not ok.any():
-            continue
-        flat = jp[ok] * n_pxf + ip[ok]
-        image.flat[:] += np.bincount(
-            flat, weights=wts[ok], minlength=n_pxf * n_pyf,
-        )
-
-
-# ======================================================================
 # Scan result
 # ======================================================================
 @dataclass(frozen=True)
@@ -550,8 +500,7 @@ class SpotScanResult:
         detector_mm: Optional[tuple[float, float]] = None,
         method: str = "auto",
         detector_center_mm: tuple[float, float] = (0.0, 0.0),
-        oversample: int = 4,
-        n_workers: int = 1,
+        oversample: int = 4
     ) -> "DataArray":
         """Compute the detector image (no plotting).
 
@@ -581,10 +530,6 @@ class SpotScanResult:
         This integrates flux over the pixel AREA and removes pixel-phase
         aliasing when the line width is below the pixel pitch (banding along
         a sharp line).  Flux is exactly conserved.  1 disables.
-        n_workers: number of parallel threads for rendering spectral lines.
-                   Each worker allocates a full (n_pxf × n_pyf) partial
-                   image, so memory scales with n_workers.  Default 1
-                   (sequential).  Useful when n_lines > 1.
         """
         if method == "auto":
             method = "rays" if self.rays is not None else "gaussian"
@@ -683,12 +628,17 @@ class SpotScanResult:
                     "oversample=%d", n_px, n_py,
                     pixel_pitch.to(u.um).value, method, ov)
 
-        def _render_line(k: int, L: list, tgt: np.ndarray) -> None:
-            """Render one spectral line into tgt (in-place)."""
+        for k, L in tqdm(enumerate(lines), total=len(lines),
+                         desc="Rendering", unit="line"):
+            if L is None:
+                continue
+            # diagnostics on the central column only (columns are near-copies)
             mid = L[len(L) // 2]
             if method == "rays" and mid[0].size > 1:
                 _warn_undersampled_shape(self, k, mid[0], mid[1], mid[2])
+            # each sub-curve carries an equal share of the line's unit flux
             for cx, cy, w, clouds in L:
+                # fine samples along the line (arc length, ~pitch/2 steps)
                 if cx.size > 1:
                     ds = np.hypot(np.diff(cx), np.diff(cy))
                     t = np.concatenate(([0.0], np.cumsum(ds)))
@@ -707,8 +657,10 @@ class SpotScanResult:
                     seg = np.zeros(1, dtype=int)
                     frac = np.zeros(1)
                 flux = 1.0 / (cxf.size * len(L))
+
                 if method == "gaussian":
                     from scipy.special import erf
+
                     for j in range(cxf.size):
                         sigma = max(wf[j] / np.sqrt(2.0), 1e-9)
                         half = 4.0 * sigma
@@ -723,37 +675,28 @@ class SpotScanResult:
                         if i0 >= i1 or j0 >= j1:
                             continue
                         sq = sigma * np.sqrt(2.0)
-                        fx = 0.5 * np.diff(
-                            erf((x_edges[i0:i1 + 1] - cxf[j]) / sq))
-                        fy = 0.5 * np.diff(
-                            erf((y_edges[j0:j1 + 1] - cyf[j]) / sq))
-                        tgt[j0:j1, i0:i1] += flux * np.outer(fy, fx)
+                        fx = 0.5 * \
+                            np.diff(erf((x_edges[i0:i1 + 1] - cxf[j]) / sq))
+                        fy = 0.5 * \
+                            np.diff(erf((y_edges[j0:j1 + 1] - cyf[j]) / sq))
+                        image[j0:j1, i0:i1] += flux * np.outer(fy, fx)
                 else:
-                    _deposit_rays_vectorized(
-                        tgt, clouds, cxf, cyf, seg, frac, flux,
-                        x_min, y_min, pitch_f, n_pxf, n_pyf,
-                    )
+                    def deposit(pts_x, pts_y, weight):
+                        ip = np.floor((pts_x - x_min) / pitch_f).astype(int)
+                        jp = np.floor((pts_y - y_min) / pitch_f).astype(int)
+                        ok = (ip >= 0) & (ip < n_pxf) & (
+                            jp >= 0) & (jp < n_pyf)
+                        np.add.at(image, (jp[ok], ip[ok]), weight)
 
-        active = [(k, L) for k, L in enumerate(lines) if L is not None]
-        if n_workers > 1 and len(active) > 1:
-            from concurrent.futures import ThreadPoolExecutor
-            workers = min(n_workers, len(active))
-            logger.info("render: %d parallel workers for %d lines",
-                        workers, len(active))
-
-            def _worker(kL: tuple) -> np.ndarray:
-                partial = np.zeros((n_pyf, n_pxf))
-                _render_line(kL[0], kL[1], partial)
-                return partial
-
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                for partial in tqdm(pool.map(_worker, active),
-                                    total=len(active),
-                                    desc="Rendering", unit="line"):
-                    image += partial
-        else:
-            for k, L in tqdm(active, desc="Rendering", unit="line"):
-                _render_line(k, L, image)
+                    for j in range(cxf.size):
+                        a, f = int(seg[j]), float(frac[j])
+                        for cloud, wgt in ((clouds[a], (1.0 - f)),
+                                           (clouds[min(a + 1, len(clouds) - 1)],
+                                            f)):
+                            if wgt <= 0.0 or cloud.shape[0] == 0:
+                                continue
+                            deposit(cloud[:, 0] + cxf[j], cloud[:, 1] + cyf[j],
+                                    flux * wgt / cloud.shape[0])
 
         if ov > 1:
             image = image.reshape(n_py, ov, n_px, ov).sum(axis=(1, 3))

@@ -258,7 +258,6 @@ def main(argv: Optional[list[str]] = None) -> None:
             pixel_pitch=pitch * u.um,
             detector_mm=(tuple(detector) if detector else None),
             oversample=oversample,
-            n_workers=n_workers,
         )
         if render_image:
             outf = zemax_file.with_suffix(".image.png")
