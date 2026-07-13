@@ -16,7 +16,6 @@ dependencies = [
     "numpy",
     "scipy",
     "pythonnet; sys_platform == 'win32'",
-    "scipy",
     "serde-dataclass",
     "dacite",
     "tomlkit",
